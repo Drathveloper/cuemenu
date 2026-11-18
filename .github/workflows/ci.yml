@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  # Lint, tests (coverage to Codecov when CODECOV_TOKEN is set) and build,
+  # from go-build-tools at the same commit as the .parent submodule.
+  checks:
+    uses: Drathveloper/go-build-tools/.github/workflows/golang_lib_workflow.yml@43d3fa07d95079219048527f61d0057e0b376573
+    secrets: inherit
+
+  # Every push to master that passes the checks becomes a release: the
+  # patch version goes up, or the minor/major one if a pushed commit
+  # message contains #minor or #major.
+  release:
+    needs: checks
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: release
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0 # tags and history, for the version and the notes
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Tag the version
+        id: version
+        run: |
+          set -euo pipefail
+          previous=$(git describe --tags --abbrev=0 --match 'v[0-9]*' HEAD^ 2>/dev/null || true)
+          if tag=$(git describe --tags --exact-match --match 'v[0-9]*' 2>/dev/null); then
+            echo "HEAD is already tagged $tag"
+          else
+            version=${previous#v}
+            IFS=. read -r major minor patch <<< "${version:-0.0.0}"
+            messages=$(git log --format=%B "${previous:+$previous..}HEAD")
+            case "$messages" in
+              *'#major'*) major=$((major + 1)); minor=0; patch=0 ;;
+              *'#minor'*) minor=$((minor + 1)); patch=0 ;;
+              *) patch=$((patch + 1)) ;;
+            esac
+            tag="v$major.$minor.$patch"
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "$tag" -m "cuemenu $tag"
+            git push origin "$tag"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "previous=$previous" >> "$GITHUB_OUTPUT"
+
+      - name: Build the binaries
+        run: make dist
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          PREVIOUS: ${{ steps.version.outputs.previous }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            echo "Release $TAG already exists"
+            exit 0
+          fi
+          {
+            echo "## Changes"
+            echo
+            git log --format='- %s (%h)' "${PREVIOUS:+$PREVIOUS..}$TAG"
+            if [ -n "$PREVIOUS" ]; then
+              echo
+              echo "**Full changelog:** https://github.com/$GITHUB_REPOSITORY/compare/$PREVIOUS...$TAG"
+            fi
+            echo
+            echo "## Install"
+            echo
+            echo '```sh'
+            echo "go install github.com/$GITHUB_REPOSITORY@$TAG"
+            echo '```'
+            echo
+            echo 'Or download the binary for your platform below; `checksums.txt` has their SHA-256 sums.'
+          } > notes.md
+          gh release create "$TAG" bin/cuemenu-* bin/checksums.txt --verify-tag --title "$TAG" --notes-file notes.md

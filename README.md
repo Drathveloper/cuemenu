@@ -68,6 +68,10 @@ make lint                               # golangci-lint with the shared strict c
 
 The code passes `make lint` with no findings. Every `//nolint` states its reason next to it.
 
+## Releases
+
+Every push to `master` runs lint, tests and the build (the go-build-tools workflow) and, if they pass, publishes a release with notes listing the commits since the previous one. The patch version goes up, or the minor or major one when a pushed commit message contains `#minor` or `#major`. Each release has binaries for Linux and macOS (amd64, arm64) and Windows (amd64), with their `checksums.txt`; `make dist` builds the same files locally.
+
 ## Status
 
 The conformance matrix (`model/conformance_test.go`) checks 75 constructs of the CUE specification. `PLAN.md` describes the design, the coverage, the deliberate deviations from CUE and what was learned about the CUE API.
