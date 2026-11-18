@@ -58,7 +58,7 @@ var matrix = []row{
 	{name: "enum with default", src: `a: *"x" | "y"`, path: "a", widget: model.Choice, want: `"x"`},
 	{name: "nested enum", src: `a: *("x" | "y") | "z"`, path: "a", widget: model.Choice, set: `"z"`, want: `"z"`},
 	{name: "numeric enum", src: `a: 1 | 2 | *3`, path: "a", widget: model.Choice, set: `2`, want: `2`},
-	{name: "null or int", src: `a: *null | int`, path: "a", widget: model.Expr, set: `5`, want: `5`},
+	{name: "null or int", src: `a: *null | int`, path: "a", widget: model.Number, set: `5`, want: `5`},
 	{name: "null or list", src: `a: *null | [...string]`, path: "a", widget: model.List, want: `null`},
 	{name: "null or list set", src: `a: *null | [...string]`, path: "a", widget: model.List, set: `["x"]`, want: `["x"]`},
 	{name: "null or list rejects kind", src: `a: *null | [...string]`, path: "a", widget: model.List, set: `[1]`, reject: true},

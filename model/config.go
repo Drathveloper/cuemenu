@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 
 	"cuelang.org/go/cue"
@@ -74,6 +75,9 @@ func (c *Config) Set(path cue.Path, x any) error {
 	if err := val.Err(); err != nil {
 		return fmt.Errorf("%w: %w", ErrInvalidExpr, err)
 	}
+	if list, idx, rest, ok := inList(path); ok {
+		return c.setElem(list, idx, rest, &val)
+	}
 	before := errorSet(c.Value())
 	saved := maps.Clone(c.edits)
 	c.unsetBelow(path)
@@ -111,6 +115,10 @@ func (c *Config) SetExpr(path cue.Path, expr string) error {
 // Unset returns the field at path, and everything below it, to its schema
 // value. Removing edits never adds a conflict, so it needs no validation.
 func (c *Config) Unset(path cue.Path) {
+	if list, idx, rest, ok := inList(path); ok {
+		_ = c.setElem(list, idx, rest, nil) // dropping a field adds no conflict
+		return
+	}
 	c.unsetBelow(path)
 	c.prune()
 }
@@ -128,7 +136,11 @@ func (c *Config) Root() *Node {
 		labels := cerr.Path()
 		sels := make([]cue.Selector, 0, len(labels))
 		for _, label := range labels {
-			sels = append(sels, cue.Str(label))
+			if idx, err := strconv.Atoi(label); err == nil { // a list element
+				sels = append(sels, cue.Index(idx))
+			} else {
+				sels = append(sels, cue.Str(label))
+			}
 		}
 		key := cue.MakePath(sels...).String()
 		errs[key] = append(errs[key], cerr.Error())
@@ -183,10 +195,21 @@ func (c *Config) Save(path string) error {
 // required fields without value, values not concrete yet and conflicts,
 // with the position in the schema of each.
 func (c *Config) Check() error {
-	if err := c.Value().Validate(cue.Concrete(true)); err != nil {
-		return fmt.Errorf("%w:\n%s", ErrIncomplete, cueerrors.Details(err, nil))
+	err := c.Value().Validate(cue.Concrete(true))
+	if err == nil {
+		return nil
 	}
-	return nil
+	// The same error can come from many places, e.g. one per "if kind ==
+	// …" while kind is not chosen: each message is shown once.
+	var unique cueerrors.Error
+	seen := map[string]bool{}
+	for _, cerr := range cueerrors.Errors(err) {
+		if !seen[cerr.Error()] {
+			seen[cerr.Error()] = true
+			unique = cueerrors.Append(unique, cerr)
+		}
+	}
+	return fmt.Errorf("%w:\n%s", ErrIncomplete, cueerrors.Details(unique, nil))
 }
 
 // Export renders the final configuration as "json" or "yaml". It fails
@@ -297,12 +320,13 @@ func (c *Config) buildNode(
 ) *Node {
 	path := child(parent, sel)
 	node := &Node{Path: path, Label: sel.Unquoted(), Doc: doc(fld), Errors: errs[path.String()]}
-	_, node.Set = c.edits[path.String()]
+	written, set := c.written(path)
+	node.Set = set && (!isStruct(written) || !hasFields(written)) // a struct is a menu: its leaves are set
 	node.Secret = secret(fld) || secret(owner.LookupPath(cue.MakePath(declSel(sel))))
 	// The widget comes from the field as declared, ignoring the user's
 	// own edits; the value shown comes from the edited config.
 	decl := fld
-	if c.edited(path) {
+	if _, _, _, inElem := inList(path); inElem || c.edited(path) {
 		decl, sel, _ = find(c.without(path), path)
 	}
 	node.Required = sel.ConstraintType() == cue.RequiredConstraint
@@ -316,17 +340,44 @@ func (c *Config) buildNode(
 func (c *Config) fill(node *Node, fld, decl cue.Value, errs map[string][]string) {
 	switch node.Widget {
 	case Menu:
-		node.Children = c.build(fld, node.Path, errs)
+		node.Children = c.build(nonNull(fld), node.Path, errs)
 	case Map:
 		c.fillMap(node, fld, decl, errs)
 	case List:
-		node.Value = leafValue(fld)
-		node.Children, node.Elem = listItems(fld, decl, node.Path)
+		node.Value = c.shown(node.Path, fld)
+		node.Children, node.Elem = c.listItems(fld, decl, node.Path, errs)
 	case Variant:
 		c.fillVariant(node, fld, decl, errs)
 	case ReadOnly, Toggle, Choice, Number, Text, Expr:
-		node.Value = leafValue(fld)
+		node.Value = c.shown(node.Path, fld)
 	}
+}
+
+// shown is the value of the field at path: if in error, what the user
+// wrote (to be fixed), not _|_.
+func (c *Config) shown(path cue.Path, fld cue.Value) string {
+	if fld.Err() != nil {
+		if written, ok := c.written(path); ok {
+			return leafValue(written)
+		}
+	}
+	return leafValue(fld)
+}
+
+// nonNull is T for a null | T not decided yet (a Go pointer not set), so
+// that the fields of T are shown and can be filled in.
+func nonNull(val cue.Value) cue.Value {
+	if val.IncompleteKind()&cue.NullKind == 0 {
+		return val
+	}
+	if op, args := expr(val); op == cue.OrOp {
+		alts := flattenOr(args)
+		alts = slices.DeleteFunc(alts, func(alt cue.Value) bool { return alt.IncompleteKind() == cue.NullKind })
+		if len(alts) == 1 {
+			return alts[0]
+		}
+	}
+	return val
 }
 
 func (c *Config) fillVariant(node *Node, fld, decl cue.Value, errs map[string][]string) {

@@ -72,7 +72,7 @@ func TestWidgets(t *testing.T) {
 		"auth.admins":              model.List,     // [...string]
 		pathOutputs:                model.List,     // [...("a"|"b")] | *["a"]
 		"log.file_path":            model.Text,     // optional field
-		pathMaxSize:                model.Expr,     // int | null: mixed kinds
+		pathMaxSize:                model.Number,   // int | null: edited as int
 		"log.filters":              model.List,     // [...{struct}]
 		"server.headers":           model.Map,      // [=~"^X-"]: string (regexp keys)
 		"cache":                    model.Variant,  // *#A | #B without discriminator
@@ -590,5 +590,236 @@ func TestComputedHint(t *testing.T) {
 	n := tree(compile(t, "n!: int\nsum: n + 1"))["sum"]
 	if n.Widget != model.ReadOnly || n.Value != "" || n.Hint != "n + 1" {
 		t.Errorf("computed: %+v", n)
+	}
+}
+
+// Values are shown without the attributes of the schema (@go, @protobuf).
+func TestValueWithoutAttributes(t *testing.T) {
+	n := tree(compile(t, `tol: [...{key: string @go(Key)}] & [{key: "a"}]`))["tol[0]"]
+	if n == nil || strings.Contains(n.Value, "@") {
+		t.Errorf("element: %+v", n)
+	}
+}
+
+// A definition whose fields depend on a choice not made yet (Holos' #Task:
+// if kind == "Helm" {helm!: ...}) is still a menu, also at the root.
+func TestFieldsAwaitingAChoice(t *testing.T) {
+	dir := t.TempDir()
+	src := "package s\n\n#T: {\n\tkind: \"a\" | \"b\"\n\tif kind == \"a\" {x!: int}\n\tif kind == \"b\" {y!: int}\n}\n\n#T\n"
+	if err := os.WriteFile(dir+"/s.cue", []byte(src), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	v, err := model.Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := model.New(v)
+	if root := c.Root(); root.Widget != model.Menu {
+		t.Fatalf("root: %+v", root)
+	}
+	if n := tree(c)["kind"]; n == nil || n.Widget != model.Choice {
+		t.Fatalf("kind: %+v", n)
+	}
+	// Each if fails the same way: the error is reported once.
+	if err := c.Check(); err == nil || strings.Count(err.Error(), "unresolved disjunction") != 1 {
+		t.Errorf("check: %v", err)
+	}
+}
+
+// Go-generated enums are a type and a disjunction: string & ("a" | "b").
+func TestTypedEnum(t *testing.T) {
+	n := tree(compile(t, `kind: string & ("a" | "b")`))["kind"]
+	if n.Widget != model.Choice || len(n.Options) != 2 {
+		t.Errorf("typed enum: %+v", n)
+	}
+}
+
+// Go pointers to scalars are null | T: edited as T, null when not set.
+func TestNullableScalars(t *testing.T) {
+	c := compile(t, "n?: null | int\nb?: null | bool\ns?: null | string")
+	nodes := tree(c)
+	for path, want := range map[string]model.Widget{"n": model.Number, "b": model.Toggle, "s": model.Text} {
+		if n := nodes[path]; n.Widget != want {
+			t.Errorf("%s: %+v", path, n)
+		}
+	}
+	set(t, c, "n", 3)
+	if got := exportJSON(t, c); got != `{"n":3}` {
+		t.Errorf("export: %s", got)
+	}
+}
+
+// A Go pointer to a struct, null | #T, is a menu with the fields of #T.
+func TestNullableStruct(t *testing.T) {
+	c := compile(t, "#P: {path?: string}\np?: null | #P")
+	if n := tree(c)["p.path"]; n == nil || n.Widget != model.Text {
+		t.Fatalf("p.path: %+v", n)
+	}
+	set(t, c, "p.path", "/x")
+	if got := exportJSON(t, c); got != `{"p":{"path":"/x"}}` {
+		t.Errorf("export: %s", got)
+	}
+}
+
+// A disjunction of booleans is a toggle, also with a type: bool & (*false | true).
+func TestBoolDisjunction(t *testing.T) {
+	nodes := tree(compile(t, "a: *false | true\nb: bool & (*false | true)"))
+	for _, path := range []string{"a", "b"} {
+		if n := nodes[path]; n.Widget != model.Toggle || n.Value != "false" {
+			t.Errorf("%s: %+v", path, n)
+		}
+	}
+}
+
+// The fields of struct elements are edited one by one, also in a list
+// inside an element; the list is saved with only what was set.
+func TestElementFields(t *testing.T) {
+	c := compile(t, `#R: {
+	receiver!: string
+	continue:  bool | *false
+	matchers: [...{name!: string, value: string | *""}]
+	kind?:     "a" | "b"
+}
+routes: [...#R]
+fixed: *[{receiver: "x"}] | [...#R]`)
+	if err := c.SetList(cue.ParsePath("routes"), []string{"{}"}); err != nil {
+		t.Fatal(err)
+	}
+	nodes := tree(c)
+	if n := nodes["routes[0].receiver"]; n == nil || n.Widget != model.Text || !n.Required {
+		t.Fatalf("element field: %+v", n)
+	}
+	if n := nodes["routes[0].kind"]; n == nil || n.Widget != model.Choice {
+		t.Fatalf("element enum: %+v", n)
+	}
+	set(t, c, "routes[0].receiver", "team")
+	if err := c.SetList(cue.ParsePath("routes[0].matchers"), []string{"{}"}); err != nil {
+		t.Fatal(err)
+	}
+	set(t, c, "routes[0].matchers[0].name", "sev")
+	if got := c.Elems(cue.ParsePath("routes")); len(got) != 1 || strings.Contains(got[0], "continue") ||
+		!strings.Contains(got[0], `name: "sev"`) || strings.Contains(got[0], "value") {
+		t.Fatalf("written element: %q", got)
+	}
+	if n := tree(c)["routes[0].matchers[0].name"]; n == nil || !n.Set || n.Value != `"sev"` {
+		t.Fatalf("nested element field: %+v", n)
+	}
+	if err := c.Set(cue.ParsePath("routes[0].nope"), 1); err == nil {
+		t.Error("undeclared field in an element accepted")
+	}
+	c.Unset(cue.ParsePath("routes[0].receiver"))
+	if n := tree(c)["routes[0].receiver"]; n.Set || len(n.Errors) != 0 {
+		t.Errorf("unset element field: %+v", n)
+	}
+
+	// An unedited default list: its elements are editable, not fixed.
+	if n := tree(c)["fixed[0].receiver"]; n == nil || n.Widget != model.Text {
+		t.Fatalf("default list element field: %+v", n)
+	}
+	set(t, c, "fixed[0].receiver", "y")
+	if got := c.Elems(cue.ParsePath("fixed")); len(got) != 1 || !strings.Contains(got[0], `"y"`) {
+		t.Fatalf("default list edited: %q", got)
+	}
+	dir := t.TempDir()
+	if err := c.Save(dir + "/c.cue"); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(dir + "/c.cue") //nolint:gosec // a file in t.TempDir()
+	if err != nil || strings.Contains(string(data), "continue") || strings.Contains(string(data), "_") {
+		t.Fatalf("saved with defaults or placeholders (%v):\n%s", err, data)
+	}
+	loaded := compile(t, `#R: {
+	receiver!: string
+	continue:  bool | *false
+	matchers: [...{name!: string, value: string | *""}]
+	kind?:     "a" | "b"
+}
+routes: [...#R]
+fixed: *[{receiver: "x"}] | [...#R]`)
+	if dropped, err := loaded.Load(dir + "/c.cue"); err != nil || len(dropped) > 0 {
+		t.Fatalf("load: %v, dropped %v", err, dropped)
+	}
+	if n := tree(loaded)["routes[0].matchers[0].name"]; n == nil || !n.Set {
+		t.Errorf("loaded element field: %+v", n)
+	}
+}
+
+// Struct variants as elements: chosen per element, by a discriminator.
+func TestVariantElements(t *testing.T) {
+	c := compile(t, "#A: {kind: \"a\", x?: int}\n#B: {kind: \"b\", y?: string}\nitems: [...(#A | #B)]")
+	if err := c.SetList(cue.ParsePath("items"), []string{"{}"}); err != nil {
+		t.Fatal(err)
+	}
+	if n := tree(c)["items[0]"]; n == nil || n.Widget != model.Variant {
+		t.Fatalf("variant element: %+v", n)
+	}
+	if _, err := c.Choose(cue.ParsePath("items[0]"), 1); err != nil {
+		t.Fatal(err)
+	}
+	set(t, c, "items[0].y", "v")
+	if n := tree(c)["items[0]"]; n.Value != "b" {
+		t.Fatalf("chosen variant: %+v", n)
+	}
+	if _, err := c.Choose(cue.ParsePath("items[0]"), 0); err != nil {
+		t.Fatalf("switching the variant of an element: %v", err)
+	}
+	if got := c.Elems(cue.ParsePath("items")); len(got) != 1 || strings.Contains(got[0], "y:") {
+		t.Errorf("fields of the old variant kept: %q", got)
+	}
+}
+
+// A recursive schema (Grafana's notification routes) nests lists of the
+// same struct: each level is a menu too.
+func TestRecursiveElements(t *testing.T) {
+	c := compile(t, `#Route: {
+	receiver?: string
+	routes?: [...#Route]
+}
+routes: [...#Route]`)
+	if err := c.SetList(cue.ParsePath("routes"), []string{"{}"}); err != nil {
+		t.Fatal(err)
+	}
+	if n := tree(c)["routes[0].routes"]; n == nil || n.Elem == nil || n.Elem.Widget != model.Menu || strings.Contains(n.Hint, "_|_") {
+		t.Fatalf("nested recursive list: %+v", n)
+	}
+	if err := c.SetList(cue.ParsePath("routes[0].routes"), []string{"{}"}); err != nil {
+		t.Fatal(err)
+	}
+	set(t, c, "routes[0].routes[0].receiver", "b")
+	if n := tree(c)["routes[0].routes[0].receiver"]; n == nil || n.Widget != model.Text || !n.Set {
+		t.Fatalf("field of a nested recursive element: %+v", n)
+	}
+	if n := tree(c)["routes[0].routes[0].routes"]; n == nil || n.Elem == nil || n.Elem.Widget != model.Menu {
+		t.Fatalf("third level: %+v", n)
+	}
+}
+
+// A loaded value that breaks an element (a file edited by hand) makes the
+// whole list bottom: the elements must still be listed, with the error on
+// the field, so it can be fixed.
+func TestElementErrors(t *testing.T) {
+	c := compile(t, `#R: {receiver?: string, port?: int & <=65535}
+routes: [...#R]
+ports: [...int]`)
+	file := t.TempDir() + "/c.cue"
+	if err := os.WriteFile(file, []byte("routes: [{receiver: 1}, {receiver: \"ok\"}]\nports: [\"x\", 2]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Load(file); err != nil {
+		t.Fatal(err)
+	}
+	nodes := tree(c)
+	if n := nodes["routes[0].receiver"]; n == nil || len(n.Errors) == 0 || n.Value != "1" {
+		t.Fatalf("error on the element field, with the value written: %+v", n)
+	}
+	if n := nodes["routes[1].receiver"]; n == nil || n.Value != `"ok"` {
+		t.Errorf("valid element next to it: %+v", n)
+	}
+	if n := nodes["ports[0]"]; n == nil || len(n.Errors) == 0 || n.Value != cueX {
+		t.Errorf("error on a scalar element: %+v", n)
+	}
+	set(t, c, "routes[0].receiver", "fixed")
+	if n := tree(c)["routes[0].receiver"]; len(n.Errors) != 0 || n.Value != `"fixed"` {
+		t.Errorf("after fixing it: %+v", n)
 	}
 }

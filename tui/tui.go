@@ -7,6 +7,7 @@ import (
 
 	"charm.land/bubbles/v2/textinput"
 	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 
 	"github.com/Drathveloper/cuemenu/model"
 )
@@ -42,6 +43,7 @@ type Model struct {
 	mode    mode               // what keys do now
 	opt     int                // choosing / searching: cursor
 	height  int                // terminal rows
+	width   int                // terminal columns
 	asExpr  bool               // editing: input is a CUE expression
 	dirty   bool               // changes not saved yet
 }
@@ -63,7 +65,7 @@ func (m *Model) Init() tea.Cmd { return nil }
 func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
-		m.height = msg.Height
+		m.height, m.width = msg.Height, msg.Width
 	case tea.KeyPressMsg:
 		if msg.String() == "ctrl+c" {
 			return m, tea.Quit
@@ -88,11 +90,23 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 // View implements tea.Model.
 func (m *Model) View() tea.View {
-	var out strings.Builder
-	m.header(&out)
-	m.body(&out)
-	m.footer(&out)
-	view := tea.NewView(out.String())
+	var head, body, foot strings.Builder
+	m.header(&head)
+	m.footer(&foot)
+	footer := foot.String()
+	if m.width > 0 { // wrapped here, so that its height is known
+		footer = lipgloss.NewStyle().Width(m.width).Render(footer)
+	}
+	rows := 0 // unknown: no limit
+	if m.height > 0 {
+		room := m.height - strings.Count(head.String(), "\n") - 1 // one menu row at least
+		if lines := strings.Split(footer, "\n"); len(lines) > room {
+			footer = strings.Join(lines[len(lines)-max(1, room):], "\n") // the editor and its errors are last
+		}
+		rows = max(1, m.height-strings.Count(head.String(), "\n")-lipgloss.Height(footer))
+	}
+	m.body(&body, rows)
+	view := tea.NewView(head.String() + body.String() + footer)
 	view.AltScreen = true
 	view.WindowTitle = "cuemenu"
 	return view

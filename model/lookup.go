@@ -45,6 +45,10 @@ func findIn(val cue.Value, sels []cue.Selector, expand bool) (cue.Value, cue.Sel
 // The field iterator yields nothing on a disjunction, so its default is
 // searched too.
 func field(val cue.Value, sel cue.Selector) (cue.Value, cue.Selector, bool) {
+	if sel.Type() == cue.IndexLabel { // an element of a list
+		elem := elemAt(val, sel.Index())
+		return elem, sel, elem.Exists()
+	}
 	if !sel.IsString() { // hidden fields and definitions are not editable
 		return cue.Value{}, cue.Selector{}, false
 	}

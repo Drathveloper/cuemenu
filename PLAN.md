@@ -16,8 +16,8 @@ A menuconfig-style editor (Go + bubbletea) for configurations written in CUE.
 1. ✅ Model: `Config.Set/Unset/Tree/Save/Load/Export`, errors per path and dropping of edits that stop applying. CLI: `cuemenu tree DIR` and `cuemenu export DIR json|yaml`.
 2. ✅ TUI (bubbletea v2): menuconfig navigation, inline errors, `/` search ranked by relevance, save with `s` and quit with `q` (asks if there are unsaved changes). Instead of a `?` help window, a panel under the list always shows the path, documentation, constraint and errors of the selected field. Brought forward from phases 3 and 4:
    - A variant is chosen on its discriminator (`database --->` › `type (postgres)`).
-   - CUE expression editor (`e`) on any editable field. It is the default control for lists, mixed kinds and `null`, and for now also the way to edit whole maps.
-3. ✅ Lists: submenu with one element per line; `a` adds (with the control of the element type: options, text, or CUE for structs), `⏎` edits, `d` deletes and `K`/`J` move. Maps: `a` asks for the key, checks it against the patterns (regexps included) and then asks for the value, or opens the entry if it is a struct; `d` deletes the entry. Variants without a discriminator: a "variant" chooser, and if the variant is told apart by a field of its own, that field is asked for.
+   - CUE expression editor (`e`) on any editable field. It is the default control for mixed kinds (other than `null | T`, edited as `T`), and for now also the way to edit whole maps.
+3. ✅ Lists: submenu with one element per line; `a` adds (with the control of the element type: options or text; a struct, variant or map element is added empty and opened as a menu of its own), `⏎` edits or opens, `d` deletes and `K`/`J` move. Maps: `a` asks for the key, checks it against the patterns (regexps included) and then asks for the value, or opens the entry if it is a struct; `d` deletes the entry. Variants without a discriminator: a "variant" chooser, and if the variant is told apart by a field of its own, that field is asked for.
 4. ✅ Conformance matrix: `model/conformance_test.go`, with 75 rows, one per construct of the specification.
 5. ✅ `cuemenu check DIR` (exit code 1 if incomplete, with the position in the schema of each problem) and `cuemenu export [-f json|yaml] [-o FILE] DIR` (format taken from the extension; flags go before or after DIR). Files are written atomically (0600 temp file + rename), and the export is 0600 if it contains secrets. Exit codes: 0 ok, 1 error or incomplete configuration, 2 bad usage.
 
@@ -55,10 +55,10 @@ A menuconfig-style editor (Go + bubbletea) for configurations written in CUE.
 
 - **`Set` stores structs as their leaves.** No edit sits inside another, so deleting a map entry does not affect the others. An empty `{}` is stored as is, because it creates an entry with no fields yet.
 - **Patterns:** `LookupPath(AnyString)` does not see regexp patterns. They are iterated with `Fields(cue.Patterns(true))` and a key is checked by unifying it with `Pattern()`. `Pattern()` may only be called on a `PatternConstraint` selector; on any other selector the returned value panics when used.
-- **Lists:** the element type comes from `LookupPath(AnyIndex)` on the arguments of `Expr()` when the list has a default. Lists are always edited whole (`SetList`), so there are never edits on an index.
+- **Lists:** the element type comes from `LookupPath(AnyIndex)` on the arguments of `Expr()` when the list has a default. Lists are always edited whole (`SetList`), so there are never edits on an index: setting a field inside an element (`routes[0].matchers[1].name`) rebuilds that element from what the user wrote in it, then sets the list (see "Struct elements" below).
 - **Variants without a discriminator:** each variant is named after its own fields (e.g. `memory` or `redis`). It is chosen by filling in one of its own fields (required ones first), and pruning drops the fields of the other one. This requires the variants to be **closed definitions**: with open structs CUE cannot tell them apart and the choice stays on the default.
 - **Flaky test found:** pruning iterates a Go map in random order, and between two edits that exclude each other it could drop the new one (it failed 27 times out of 30). Edits just made now take priority. Tests are run with `-count=30`.
-- **Known limits:** struct elements of a list are edited as CUE text, with no per-field submenu. Expressions cannot reference other fields.
+- **Known limits:** expressions cannot reference other fields.
 
 ## Phase 4 findings: coverage of the CUE specification
 
@@ -114,6 +114,38 @@ Also fixed after that run:
 
 - **Computed fields waiting for their inputs** (Timoni's `clusterVersion.major`, computed from `kubeVersion` with `strconv.Atoi`, or a label that is `name & …`) were editable expressions until the input was set; a value typed there would make the later input be rejected. While a required input is missing such a field has no kind at all (`IncompleteKind()` is bottom), whereas a type or a validator keeps one (`a: Mode`, `string & strings.MaxRunes(3)`), so a bottom field that is not a struct is now read-only, shown as `(computed)` with its formula as hint.
 - **Values on one line, also in the editor:** strings are unquoted with `literal.Unquote` (`"""…"""` and `#"raw"#` were shown, and edited, with their quotes) and values are clipped at 40 characters in the menu. The editor is one line and `textinput` turns line breaks into spaces: a multi-line text was silently flattened on Enter, and a struct edited with `e` became invalid CUE (`{ a: 1 b: 2 }`). Multi-line text is now edited as an escaped CUE string, and multi-line values reach the editor as JSON, which is CUE on one line.
+
+## Manual TUI pass and more schemas (Holos, Grafana app kinds)
+
+The TUI was driven by hand (pty + `pyte`) on Timoni `redis`, KubeVela `webservice` and Grafana's `DashboardSpec` v2beta1, and `tree` was run on Holos v1beta1 (`author.#Helm`, `#Kustomize`, `#Kubernetes`, `#Platform`; `core.#Task`, `#TaskSet`, `#Platform`, `#Helm`) and on the 41 `*Spec` kinds of Grafana's apps (alerting, iam, secret, correlations, dashboard). All of them load, and none falls back to the expression editor any more. Fixed:
+
+- **The screen grew past the terminal:** the menu got the terminal height minus a fixed 9 rows, but the details under it vary (documentation, constraint, editor, errors). In a 30-row terminal the error of a rejected value was below the screen. The footer is now wrapped to the terminal width and measured, the menu gets the rows left, and if the footer alone does not fit its first lines (documentation) are dropped, so that the editor, its errors and the help stay visible. Choosers and search results scroll too (a choice with 30 options overflowed).
+- **Attributes in values:** a list element from the Kubernetes types showed as `{ key: "a" @go(Key) @protobuf(…) }`. `Syntax` now leaves attributes out.
+- **New map entries that are variants or maps** (the dashboard's `elements: [string]: Element | *{}`) opened an empty CUE editor. Like struct entries, they are now created and opened, so the variant is chosen from its menu.
+- **Incomplete is not an error at load time:** Holos' `core.#Task` has `if kind == "Helm" {helm!: …}` for each kind. While `kind` is not chosen the comprehensions cannot be evaluated, and `Load` failed with "unresolved disjunction". `Load` now uses `Validate()`, which reports only permanent errors, and a conjunction (`p.#Task` embedded at the root) whose kind is bottom but lists fields is a struct. Choosing `kind` then shows only the fields of that kind. `check` printed the same error once per `if`; each message is now shown once.
+- **Go-generated enums** (`kind: string & ("Resources" | "Helm" | …)`) were text: the disjunction is now found when the other conjuncts are types that every alternative has.
+- **Go pointers, `null | T`** (`cue get go`; about 270 fields in the corpus: `null | int`, `null | bool`, `null | string`, `null | #Probe`…) were all expression editors. They now get the widget of `T`, and while not set, a `null | #Struct` menu lists the fields of `#Struct`. As with `*null | [...T]`, `r` puts the null back; `e` can still type `null`.
+- **Boolean disjunctions** (`*false | true`, also as `bool & (*false | true)`) are a toggle instead of a two-option choice.
+- **Small TUI fixes:** the prompt for a new key showed an empty `[]` details line.
+
+Notes:
+
+- `pyte` 0.8.2 mishandles `insert_lines`/`delete_lines` (a target row is not cleared when its source row was never written) and lacks `CSI S`/`CSI T`, which bubbletea's renderer uses. Without patching it, the manual tests show stale lines that a real terminal does not.
+- Variants that cannot be told apart, such as `Element | *{}` (where `{}` has no `kind`), are named `variant 1…n`.
+
+## Struct elements of lists
+
+The gap most real schemas hit (Grafana's routes, matchers, permissions, layout items; Kubernetes tolerations, ports): a struct element was typed whole as CUE, and saved with every default copied in.
+
+- **A struct element is a menu** of its fields, built like any struct, recursively: a list inside an element (matchers of a route) is a list again, a variant element has its chooser or discriminator, a map element takes keys. `a` adds `{}` and opens it; `e` still edits the whole element as CUE.
+- **Lists are still one edit.** `Set` and `Unset` on a path inside an element split it at the last index (`inList`) and rebuild that element from its leaves as the user wrote them (`written`: the list edit, or the one of an enclosing list), plus the change, then set the list. Nested lists recurse through `Set`. Only what was set is saved: no defaults, no placeholders.
+- **Variants in elements:** like `prune` for edits, the fields kept in an element that no longer exist once the new ones are set (those of a variant no longer chosen) are dropped (`pruneElem`).
+- **The widget of a field inside an element** comes from the element constraint (`field` follows index selectors through `elemAt`), so a field of an element from a schema default list is editable, not read-only.
+- **Recursive schemas** (`#Route: {routes?: [...#Route]}`): the element type of a nested list is a structural cycle when looked up on its own; unified with a `{}` element it is the right struct. Its hint, which prints as `[..._|_]`, is not shown.
+- The summary of an element shows what the user wrote, not the schema merged in (`continue: bool`).
+- **Errors inside elements:** in CUE an element with a field in error is bottom, and so is its list: `List()` fails and the elements vanished from the menu, with the error shown nowhere (only `check` saw it, e.g. after editing `.config.cue` by hand). Elements are now looked up by index, which still works, and their fields by iteration, which does too; errors reported as `routes.0.receiver` are matched to `routes[0].receiver`. A field in error shows the value written (`1`), not `_|_ // …`, anywhere in the tree.
+- Struct variants in lists without a discriminator are named by their own fields, as elsewhere; `variant 1…n` is only for alternatives with no field of their own (`Element | *{}`).
+- Tried by hand on Grafana's `RouteTreeSpec` (three levels of routes, matchers, toggles) and a list of discriminated layout items; the 134 corpus schemas load with identical trees.
 
 ## Tooling
 

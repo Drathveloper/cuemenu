@@ -95,7 +95,7 @@ func (m *Model) remove() tea.Cmd {
 	switch {
 	case node == nil:
 	case isList(cont):
-		elems, idx := m.elems(cont), index(node)
+		elems, idx := m.cfg.Elems(cont.Path), index(node)
 		m.apply(m.cfg.SetList(cont.Path, slices.Delete(elems, idx, idx+1)))
 	case node.Set || isMap(cont):
 		m.cfg.Unset(node.Path) // in a map, removes the whole entry
@@ -118,24 +118,37 @@ func (m *Model) add() tea.Cmd {
 	return nil
 }
 
+// addElem appends an element: a struct (also a variant, a map) is added
+// empty and opened; any other is asked for first.
 func (m *Model) addElem(list *model.Node) {
-	m.editOrChoose(list.Elem, func(val string) error {
-		return m.cfg.SetList(list.Path, append(m.elems(list), val))
-	})
-	if m.mode == editing && list.Elem.Widget == model.Menu {
-		m.input.SetValue("{}")
+	add := func(val string) error { return m.cfg.SetList(list.Path, append(m.cfg.Elems(list.Path), val)) }
+	if !hasMenu(list.Elem) {
+		m.editOrChoose(list.Elem, add)
+		return
 	}
+	if err := add("{}"); err != nil {
+		m.status = err.Error()
+		return
+	}
+	m.changed()
+	m.stack = append(m.stack, frame{path: list.Elem.Path.String()})
 }
 
-// addEntry asks for a key, then creates the entry: a struct entry is
-// created and opened; any other asks for its value next.
+// hasMenu: node opens a menu of its own (fields, entries or a variant).
+func hasMenu(node *model.Node) bool {
+	return slices.Contains([]model.Widget{model.Menu, model.Variant, model.Map}, node.Widget)
+}
+
+// addEntry asks for a key, then creates the entry: a struct entry (also a
+// variant or a map) is created and opened; any other asks for its value
+// next.
 func (m *Model) addEntry(mapNode *model.Node) {
 	m.editWith(&model.Node{Label: "new key", Hint: mapNode.Hint}, false, func(key string) error {
 		entry, err := m.cfg.Entry(mapNode.Path, key)
 		if err != nil {
 			return fmt.Errorf("new entry: %w", err)
 		}
-		if entry.Widget != model.Menu {
+		if !hasMenu(entry) {
 			m.editOrChoose(entry, nil)
 			return nil
 		}
@@ -158,7 +171,7 @@ func (m *Model) moveElem(delta int) {
 	}
 	from := index(node)
 	dest := from + delta
-	elems := m.elems(cont)
+	elems := m.cfg.Elems(cont.Path)
 	if dest < 0 || dest >= len(elems) {
 		return
 	}
@@ -188,7 +201,7 @@ func (m *Model) open(node *model.Node) {
 	if node == nil {
 		return
 	}
-	if cont := m.container(); isList(cont) {
+	if cont := m.container(); isList(cont) && !hasMenu(node) && node.Widget != model.List {
 		m.editOrChoose(node, m.setElem(cont, index(node)))
 		return
 	}
@@ -270,19 +283,10 @@ func (m *Model) chooseVariant(node *model.Node) func(string) error {
 // setElem replaces element idx of list with a CUE value.
 func (m *Model) setElem(list *model.Node, idx int) func(string) error {
 	return func(val string) error {
-		elems := m.elems(list)
+		elems := m.cfg.Elems(list.Path)
 		elems[idx] = val
 		return m.cfg.SetList(list.Path, elems)
 	}
-}
-
-// elems is the current list as CUE text, one string per element.
-func (m *Model) elems(list *model.Node) []string {
-	out := make([]string, 0, len(list.Children))
-	for _, elem := range list.Children {
-		out = append(out, elem.Value)
-	}
-	return out
 }
 
 func (m *Model) toggle(node *model.Node) {

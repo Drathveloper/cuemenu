@@ -61,7 +61,9 @@ func Load(dir string) (cue.Value, error) {
 		return cue.Value{}, fmt.Errorf("loading %s: %w", dir, inst.Err)
 	}
 	schema := cuecontext.New().BuildInstance(inst)
-	if err := schema.Err(); err != nil {
+	// Validate, not Err: a value still incomplete is no error, it is what
+	// the user fills in (e.g. if kind == "a" {…} before kind is chosen).
+	if err := schema.Validate(); err != nil {
 		return cue.Value{}, fmt.Errorf("evaluating %s: %w", dir, err)
 	}
 	return schema, nil
@@ -89,6 +91,8 @@ func classifyDisjunction(node *Node, alts []cue.Value) bool {
 	case all(alts, isStruct):
 		node.Widget = Variant
 		node.Options, node.discr = variantNames(alts)
+	case all(alts, func(alt cue.Value) bool { return alt.IncompleteKind() == cue.BoolKind }):
+		node.Widget = Toggle // *false | true
 	case all(alts, isConstScalar):
 		node.Widget = Choice
 		for _, alt := range alts {
@@ -162,22 +166,47 @@ func expr(val cue.Value) (cue.Op, []cue.Value) {
 	return operator, args
 }
 
-// embeddedOr finds the disjunction of a struct that only embeds one next
-// to definitions or lets, which declare no fields: at the top of a file,
-// "#A: {…}, #B: {…}, #A | #B" is {#A, #B} & (#A | #B).
+// embeddedOr finds the one disjunction of a conjunction whose other parts
+// add nothing to it:
+//   - definitions or lets next to it, which declare no fields: at the top
+//     of a file, "#A: {…}, #B: {…}, #A | #B" is {#A, #B} & (#A | #B);
+//   - a type every alternative has, as in Go-generated enums:
+//     string & ("a" | "b").
 func embeddedOr(args []cue.Value) ([]cue.Value, bool) {
-	var alts []cue.Value
+	var alts, types []cue.Value
 	for _, arg := range args {
 		operator, sub := expr(arg)
 		switch {
 		case operator == cue.OrOp && alts == nil:
 			alts = sub
-		case operator != cue.OrOp && arg.IncompleteKind() == cue.StructKind && !declaresFields(arg):
+		case operator == cue.OrOp:
+			return nil, false
+		case isStruct(arg) && !declaresFields(arg):
+		case isScalarType(arg):
+			types = append(types, arg)
 		default:
 			return nil, false
 		}
 	}
+	if !haveTypes(flattenOr(alts), types) {
+		return nil, false
+	}
 	return alts, alts != nil
+}
+
+// isScalarType reports whether val is a type such as string or int.
+func isScalarType(val cue.Value) bool {
+	return !val.IsConcrete() && val.IncompleteKind()&(cue.StructKind|cue.ListKind) == 0
+}
+
+// haveTypes reports whether every alternative has all the types.
+func haveTypes(alts, types []cue.Value) bool {
+	for _, typ := range types {
+		if !all(alts, func(alt cue.Value) bool { return alt.Unify(typ).Err() == nil }) {
+			return false
+		}
+	}
+	return true
 }
 
 // declaresFields reports whether val has regular fields or patterns;
@@ -193,14 +222,13 @@ func declaresFields(val cue.Value) bool {
 // which still has fields.
 func kindOf(val cue.Value, op cue.Op, args []cue.Value) cue.Kind {
 	kind := val.IncompleteKind()
-	switch {
-	case kind != cue.BottomKind:
-	case op == cue.AndOp:
+	if kind == cue.BottomKind && op == cue.AndOp {
 		kind = cue.TopKind
 		for _, arg := range args {
 			kind &= arg.IncompleteKind()
 		}
-	case hasFields(val):
+	}
+	if kind == cue.BottomKind && hasFields(val) {
 		kind = cue.StructKind
 	}
 	return kind
@@ -214,6 +242,9 @@ func hasFields(val cue.Value) bool {
 }
 
 func kindWidget(val cue.Value, kind cue.Kind) Widget {
+	if kind != cue.NullKind { // null | T, a Go pointer: edited as T
+		kind &^= cue.NullKind
+	}
 	switch {
 	case kind == cue.StructKind && len(patterns(val)) > 0:
 		return Map
@@ -244,6 +275,14 @@ func scalarWidget(kind cue.Kind) Widget {
 }
 
 // hint is the constraint shown next to a field that can still change.
+// listHint: the type of a list is worth showing, unless the list is fixed
+// or recursive (it prints as [..._|_]).
+func listHint(decl cue.Value) bool {
+	_, hasDefault := decl.Default()
+	fixed := decl.IsConcrete() && !hasDefault
+	return !fixed && !strings.Contains(format(decl), "_|_")
+}
+
 func hint(widget Widget, decl cue.Value) string {
 	switch widget {
 	case Map:
@@ -252,7 +291,7 @@ func hint(widget Widget, decl cue.Value) string {
 		}
 		return strings.Join(patterns(decl), "\n")
 	case List:
-		if _, hasDefault := decl.Default(); decl.IsConcrete() && !hasDefault {
+		if !listHint(decl) {
 			return ""
 		}
 	case ReadOnly:
@@ -281,7 +320,8 @@ func flattenOr(args []cue.Value) []cue.Value {
 }
 
 // leafValue is the concrete value of val, or its default, as CUE text.
-// Final drops what is not data, e.g. an open list prints [] not [...string].
+// Final drops what is not data, e.g. an open list prints [] not [...string],
+// and the attributes of the schema (@go) are left out.
 func leafValue(val cue.Value) string {
 	if def, ok := val.Default(); ok && !val.IsConcrete() {
 		val = def
@@ -289,7 +329,7 @@ func leafValue(val cue.Value) string {
 	if !val.IsConcrete() {
 		return ""
 	}
-	text, err := cueformat.Node(val.Syntax(cue.Final()))
+	text, err := cueformat.Node(val.Syntax(cue.Final(), cue.Attributes(false)))
 	if err != nil {
 		return format(val)
 	}

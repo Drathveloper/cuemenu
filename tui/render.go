@@ -13,10 +13,10 @@ import (
 )
 
 const (
-	reservedRows = 9   // header, details and help around the menu
-	maxSummary   = 40  // longer list summaries show the count instead
-	maxHint      = 100 // longer constraints are clipped
-	maxValue     = 40  // and longer values
+	maxSummary = 40  // longer list summaries show the count instead
+	maxHint    = 100 // longer constraints are clipped
+	maxValue   = 40  // and longer values
+	searchRows = 2   // the search box and a blank line under it
 )
 
 func selStyle() lipgloss.Style  { return lipgloss.NewStyle().Reverse(true) }
@@ -37,33 +37,40 @@ func (m *Model) header(out *strings.Builder) {
 	out.WriteString(dimStyle().Render(crumb) + "\n\n")
 }
 
-func (m *Model) body(out *strings.Builder) {
+// body writes the menu, the options or the search results in rows lines
+// (0: no limit), scrolled to keep the cursor visible.
+func (m *Model) body(out *strings.Builder, rows int) {
 	switch m.mode {
 	case choosing:
-		for idx, opt := range m.target.Options {
+		first, end := window(m.opt, len(m.target.Options), rows)
+		for idx, opt := range m.target.Options[first:end] {
 			mark := "( )"
 			if opt == m.target.Value {
 				mark = "(X)"
 			}
-			out.WriteString(row(fmt.Sprintf(" %s %s", mark, unquote(opt)), idx == m.opt) + "\n")
+			out.WriteString(row(fmt.Sprintf(" %s %s", mark, unquote(opt)), first+idx == m.opt) + "\n")
 		}
 	case searching:
 		out.WriteString(m.input.View() + "\n\n")
-		for idx, node := range m.results {
-			out.WriteString(row(" "+node.Path.String(), idx == m.opt) + "\n")
+		if rows > 0 {
+			rows = max(1, rows-searchRows)
+		}
+		lo, hi := window(m.opt, len(m.results), rows)
+		for idx, node := range m.results[lo:hi] {
+			out.WriteString(row(" "+node.Path.String(), lo+idx == m.opt) + "\n")
 		}
 	case browse, editing, confirmQuit:
-		m.menu(out)
+		m.menu(out, rows)
 	}
 }
 
-func (m *Model) menu(out *strings.Builder) {
+func (m *Model) menu(out *strings.Builder, rows int) {
 	items := m.items()
 	cursor := m.top().cursor
 	if len(items) == 0 {
 		out.WriteString(dimStyle().Render(" (empty)") + "\n")
 	}
-	lo, hi := window(cursor, len(items), m.height-reservedRows)
+	lo, hi := window(cursor, len(items), rows)
 	for idx := lo; idx < hi; idx++ {
 		out.WriteString(row(" "+Line(items[idx]), idx == cursor) + "\n")
 	}
@@ -127,14 +134,16 @@ func (m *Model) browseHelp() string {
 
 func details(node *model.Node) string {
 	var out strings.Builder
-	info := node.Path.String() + "  [" + string(node.Widget) + "]"
-	if node.Required {
-		info += "  required"
+	if node.Widget != "" { // else a prompt, e.g. for a new key: no field yet
+		info := node.Path.String() + "  [" + string(node.Widget) + "]"
+		if node.Required {
+			info += "  required"
+		}
+		if node.Optional {
+			info += "  optional"
+		}
+		out.WriteString(dimStyle().Render(info) + "\n")
 	}
-	if node.Optional {
-		info += "  optional"
-	}
-	out.WriteString(dimStyle().Render(info) + "\n")
 	if node.Doc != "" {
 		out.WriteString(node.Doc + "\n")
 	}
@@ -161,7 +170,7 @@ func entry(node *model.Node) string {
 		return fmt.Sprintf("[%s] %s", mark, node.Label)
 	case model.Menu, model.Map:
 		if isElem(node) { // struct element of a list
-			return node.Label + " " + compact(val)
+			return fmt.Sprintf("    %s %s  --->", node.Label, compact(val))
 		}
 		return fmt.Sprintf("    %s  --->", node.Label)
 	case model.List:

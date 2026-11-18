@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"cuelang.org/go/cue"
+	"cuelang.org/go/cue/cuecontext"
 	"cuelang.org/go/cue/literal"
 )
 
@@ -114,9 +115,9 @@ func (c *Config) dropUndeclared(path cue.Path, alt cue.Value) {
 
 // listItems returns a node per element of the list fld, plus a template
 // for new elements taken from the element constraint of the unedited list
-// decl. Lists are edited as a whole (see SetList), so elements carry no
-// edits.
-func listItems(fld, decl cue.Value, path cue.Path) ([]*Node, *Node) {
+// decl. A struct element is a menu of its fields; the list is still saved
+// whole (see setElem).
+func (c *Config) listItems(fld, decl cue.Value, path cue.Path, errs map[string][]string) ([]*Node, *Node) {
 	elem := elemType(decl)
 	var tmpl *Node
 	if elem.Exists() {
@@ -126,22 +127,148 @@ func listItems(fld, decl cue.Value, path cue.Path) ([]*Node, *Node) {
 	if def, ok := fld.Default(); ok && !fld.IsConcrete() {
 		fld = def
 	}
+	written := c.Elems(path) // shown, and edited with e, as written
 	var items []*Node
-	iter, err := fld.List()
-	for idx := 0; err == nil && iter.Next(); idx++ {
-		constraint := elem
-		if !constraint.Exists() { // closed list: per-position constraint
-			constraint = decl.LookupPath(cue.MakePath(cue.Index(idx)))
+	// By index: an element with an error makes the list bottom and List
+	// fails, but its elements, and their fields, can still be looked up.
+	for idx := 0; ; idx++ {
+		elemVal := fld.LookupPath(cue.MakePath(cue.Index(idx)))
+		if !elemVal.Exists() {
+			break
 		}
 		item := &Node{Path: index(path, idx), Label: fmt.Sprintf("[%d]", idx)}
+		item.Errors = errs[item.Path.String()]
+		constraint := elemAt(decl, idx)
 		classify(item, constraint)
-		item.Value = leafValue(iter.Value())
+		c.fill(item, elemVal, constraint, errs)
+		if item.Value == "" && idx < len(written) {
+			item.Value = written[idx]
+		}
 		items = append(items, item)
 	}
 	if tmpl != nil {
 		tmpl.Path = index(path, len(items))
 	}
 	return items, tmpl
+}
+
+// elemAt is the constraint of element idx of the list declared as list:
+// T in [...T], else that of the position in a closed list.
+func elemAt(list cue.Value, idx int) cue.Value {
+	if elem := elemType(list); elem.Exists() {
+		return elem
+	}
+	return list.LookupPath(cue.MakePath(cue.Index(idx)))
+}
+
+// Elems is the list at path as CUE text, one string per element, as the
+// user wrote them: defaults are not copied in.
+func (c *Config) Elems(path cue.Path) []string {
+	elems := c.elems(path)
+	out := make([]string, len(elems))
+	for idx, elem := range elems {
+		out[idx] = leafValue(elem)
+	}
+	return out
+}
+
+// elems are the elements of the list at path as the user wrote them (an
+// edit holds a list whole, also one inside an element of another list),
+// else as they are now: the schema's default.
+func (c *Config) elems(path cue.Path) []cue.Value {
+	list, ok := c.written(path)
+	if !ok {
+		list = c.ctx.CompileString(leafValue(c.Value().LookupPath(path)))
+	}
+	var out []cue.Value
+	iter, err := list.List()
+	for err == nil && iter.Next() {
+		out = append(out, iter.Value())
+	}
+	return out
+}
+
+// written is what the user wrote at path: an edit at path or above it (a
+// list edit holds its elements and what is inside them).
+func (c *Config) written(path cue.Path) (cue.Value, bool) {
+	sels := path.Selectors()
+	for size := len(sels); size > 0; size-- {
+		if ed, ok := c.edits[cue.MakePath(sels[:size]...).String()]; ok {
+			val := ed.val.LookupPath(cue.MakePath(sels[size:]...))
+			return val, val.Exists()
+		}
+	}
+	return cue.Value{}, false
+}
+
+// setElem sets the field at rest inside element idx of the list at list,
+// or removes it (val nil). Lists are edited whole, so the element is
+// rebuilt from what the user wrote in it plus the change.
+func (c *Config) setElem(list cue.Path, idx int, rest cue.Path, val *cue.Value) error {
+	elems := c.elems(list)
+	if idx >= len(elems) {
+		return fmt.Errorf("%s: %w", index(list, idx), ErrUndeclared)
+	}
+	var kept, fresh []edit
+	if len(rest.Selectors()) > 0 {
+		for _, ed := range leaves(elems[idx], cue.Path{}) {
+			if !under(ed.path, rest) {
+				kept = append(kept, ed)
+			}
+		}
+	}
+	if val != nil {
+		fresh = leaves(*val, rest)
+	}
+	elems[idx] = c.rebuild(c.pruneElem(list, idx, kept, fresh), len(rest.Selectors()) == 0)
+	return c.Set(list, c.ctx.NewList(elems...))
+}
+
+// pruneElem drops the fields kept in an element that no longer exist with
+// the fresh ones, e.g. those of a variant no longer chosen: what prune
+// does with the edits of a struct.
+func (c *Config) pruneElem(list cue.Path, idx int, kept, fresh []edit) []edit {
+	decl, _, found := find(c.without(list), list)
+	if !found {
+		return append(kept, fresh...)
+	}
+	constraint := elemAt(decl, idx)
+	for changed := true; changed; {
+		changed = false
+		for pos, ed := range kept {
+			others := slices.Delete(slices.Clone(kept), pos, pos+1)
+			if _, _, ok := find(constraint.Unify(c.rebuild(append(others, fresh...), false)), ed.path); !ok {
+				kept, changed = others, true
+				break
+			}
+		}
+	}
+	return append(kept, fresh...)
+}
+
+// rebuild makes a struct of leaves, or any value if whole (the leaf is
+// the element itself).
+func (c *Config) rebuild(parts []edit, whole bool) cue.Value {
+	val := c.ctx.CompileString("{}")
+	if whole {
+		val = c.ctx.CompileString("_")
+	}
+	for _, ed := range parts {
+		val = val.FillPath(ed.path, ed.val)
+	}
+	return val
+}
+
+// inList splits a path inside a list element (ports[0].name) into the
+// list, the index and the path inside the element, at the last index.
+func inList(path cue.Path) (cue.Path, int, cue.Path, bool) {
+	sels := path.Selectors()
+	for pos, sel := range slices.Backward(sels) {
+		if sel.Type() == cue.IndexLabel {
+			return cue.MakePath(sels[:pos]...), sel.Index(), cue.MakePath(sels[pos+1:]...), true
+		}
+	}
+	return cue.Path{}, 0, cue.Path{}, false
 }
 
 func index(list cue.Path, idx int) cue.Path {
@@ -151,17 +278,28 @@ func index(list cue.Path, idx int) cue.Path {
 // elemType is T in [...T], also when the list has a default
 // (*["a"] | [...T]): then it is found in the expression's arguments.
 func elemType(decl cue.Value) cue.Value {
-	anyIndex := cue.MakePath(cue.AnyIndex)
-	if elem := decl.LookupPath(anyIndex); elem.Exists() {
+	if elem, ok := elemOf(decl); ok {
 		return elem
 	}
 	_, args := expr(decl)
 	for _, arg := range args {
-		if elem := arg.LookupPath(anyIndex); elem.Exists() {
+		if elem, ok := elemOf(arg); ok {
 			return elem
 		}
 	}
 	return cue.Value{}
+}
+
+// elemOf is T in the list [...T]. In a recursive schema (#R: {sub?:
+// [...#R]}) the T of a nested list is a structural cycle until it is
+// unified with an element, so it is read from one.
+func elemOf(list cue.Value) (cue.Value, bool) {
+	elem := list.LookupPath(cue.MakePath(cue.AnyIndex))
+	if elem.Exists() && elem.Err() != nil {
+		probe := list.Unify(cuecontext.New().CompileString("[{}]"))
+		elem = probe.LookupPath(cue.MakePath(cue.Index(0)))
+	}
+	return elem, elem.Exists()
 }
 
 // askFor returns the field that tells variant idx apart, to be filled in.

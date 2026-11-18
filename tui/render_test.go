@@ -1,10 +1,13 @@
 package tui_test
 
 import (
+	"fmt"
 	"os"
 	"strings"
 	"testing"
 
+	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 	"cuelang.org/go/cue"
 
 	"github.com/Drathveloper/cuemenu/model"
@@ -70,8 +73,8 @@ func load(t *testing.T, src string) *tui.Model {
 }
 
 func TestRootContainers(t *testing.T) {
-	m := load(t, `[string]: string | null`) // a map: a adds a key
-	press(t, m, "'a", "'app", "enter", `'"web"`, "enter")
+	m := load(t, `[string]: string | null`)             // a map: a adds a key
+	press(t, m, "'a", "'app", "enter", "'web", "enter") // string | null: typed as text
 	if n := m.Selected(); n == nil || n.Path.String() != "app" || n.Value != `"web"` {
 		t.Fatalf("root map entry: %+v (%s)", n, m.Status())
 	}
@@ -162,5 +165,68 @@ func TestComputedPending(t *testing.T) {
 	node := &model.Node{Label: "major", Widget: model.ReadOnly, Path: cue.ParsePath("major")}
 	if got := tui.Line(node); got != "-*- major (computed)" {
 		t.Errorf("computed field waiting for its inputs: %q", got)
+	}
+}
+
+// The screen never grows past the terminal: the menu shrinks so that the
+// details, the editor and its error stay visible, and long option lists
+// scroll.
+func TestFitsTheTerminal(t *testing.T) {
+	var src strings.Builder
+	src.WriteString("// one\n// two\n// three\n// four\n")
+	for idx := range 30 {
+		fmt.Fprintf(&src, "f%d: *512 | int & >=64\n", idx)
+	}
+	src.WriteString(`c: "o" | *"p" | "q"`)
+	for idx := range 30 {
+		fmt.Fprintf(&src, ` | "o%d"`, idx)
+	}
+	m := load(t, src.String())
+	m.Update(tea.WindowSizeMsg{Width: 60, Height: 15})
+	press(t, m, "enter", "ctrl+u", "'10", "enter")
+	screen := m.View().Content
+	if !fits(screen, 60, 15) || !strings.Contains(screen, "out of bound") {
+		t.Errorf("rejected value:\n%s", screen)
+	}
+	press(t, m, "esc")
+	for range 30 {
+		press(t, m, "down")
+	}
+	press(t, m, "enter")
+	for range 25 {
+		press(t, m, "down")
+	}
+	screen = m.View().Content
+	if !fits(screen, 60, 15) || !strings.Contains(screen, "o23") {
+		t.Errorf("long chooser:\n%s", screen)
+	}
+}
+
+func fits(screen string, width, height int) bool {
+	lines := strings.Split(screen, "\n")
+	for _, line := range lines {
+		if lipgloss.Width(line) > width {
+			return false
+		}
+	}
+	return len(lines) <= height
+}
+
+// The prompt for a new key has no field to describe yet.
+func TestNewKeyPrompt(t *testing.T) {
+	m := load(t, `[string]: string`)
+	press(t, m, "'a")
+	if screen := m.View().Content; strings.Contains(screen, "  []") || !strings.Contains(screen, "Constraint: [string]: string") {
+		t.Errorf("new key prompt:\n%s", screen)
+	}
+}
+
+// A new entry that is a struct of any kind (a variant, a map) is created
+// and opened, as a plain struct entry is.
+func TestNewVariantEntry(t *testing.T) {
+	m := load(t, `els: [string]: {kind: "a", x?: int} | {kind: "b", y?: string}`)
+	press(t, m, "enter", "'a", "'p1", "enter")
+	if c := m.Container(); m.Mode() != "browse" || c == nil || c.Path.String() != "els.p1" || c.Widget != model.Variant {
+		t.Fatalf("new variant entry: mode %s, container %+v (%s)", m.Mode(), c, m.Status())
 	}
 }

@@ -41,7 +41,7 @@ cuemenu help                                  # full help: commands, flags, edit
 | `*"a" \| "b"` | list of options |
 | `int & >=1 & <=65535`, `string`, validators | field validated as you type |
 | struct | submenu |
-| `[...T]` | editable list |
+| `[...T]` | editable list; a struct element is a submenu of its own |
 | `[string]: T`, `[=~"^X-"]: T` | map: keys are checked against the pattern |
 | `#A \| #B` | variant: choosing one changes the fields |
 | computed or fixed field | read-only |

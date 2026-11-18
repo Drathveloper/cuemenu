@@ -1,6 +1,7 @@
 package tui_test
 
 import (
+	"os"
 	"strings"
 	"testing"
 
@@ -139,7 +140,7 @@ func values(n *model.Node) []string {
 }
 
 func TestListEditing(t *testing.T) {
-	m, _ := newModel(t)
+	m, file := newModel(t)
 	press(t, m, "'/", "'outputs", "enter", "enter") // into the list
 	if c := m.Container(); c == nil || c.Widget != model.List {
 		t.Fatal("enter on a list should open it")
@@ -159,16 +160,44 @@ func TestListEditing(t *testing.T) {
 		t.Fatalf("edit element via chooser: %v", got)
 	}
 
-	// List of structs: new elements are typed as CUE.
+	// List of structs: a new element is added empty and opened as a menu
+	// of its fields. Only what is set is saved, not the defaults.
 	press(t, m, "esc", "'/", "'filters", "enter", "enter", "'a")
-	if m.Mode() != modeEditing || m.Input() != "{}" {
-		t.Fatalf("struct element should open the CUE editor with {}: mode %s %q", m.Mode(), m.Input())
+	if c := m.Container(); m.Mode() != "browse" || c == nil || c.Path.String() != "log.filters[0]" || len(c.Children) != 2 {
+		t.Fatalf("struct element should open as a menu: mode %s %+v (%s)", m.Mode(), c, m.Status())
 	}
-	m.SetInput(`{module: "db", level: "info"}`)
-	press(t, m, "enter")
+	press(t, m, "enter", "'db", "enter") // module
+	if n := m.Selected(); n.Value != `"db"` || !n.Set {
+		t.Fatalf("element field: %+v (%s)", n, m.Status())
+	}
+	if got := saved(t, m, file); !strings.Contains(got, `module: "db"`) || strings.Contains(got, "level") {
+		t.Fatalf("element saved with defaults:\n%s", got)
+	}
+	press(t, m, "down", "enter", "down", "enter") // level: info
+	if got := saved(t, m, file); !strings.Contains(got, `level:  "info"`) {
+		t.Fatalf("element level:\n%s", got)
+	}
+	press(t, m, "'r") // back to the default
+	if got := saved(t, m, file); strings.Contains(got, "level") || m.Selected().Value != `"debug"` {
+		t.Fatalf("element field reset:\n%s", got)
+	}
+	press(t, m, "esc")
+	if n := m.Selected(); n.Set {
+		t.Errorf("a struct element is a menu, not a set value: %+v", n)
+	}
 	if got := values(m.Container()); len(got) != 1 || !strings.Contains(got[0], `module: "db"`) {
 		t.Fatalf("filters: %v", got)
 	}
+}
+
+func saved(t *testing.T, m *tui.Model, file string) string {
+	t.Helper()
+	press(t, m, "'s")
+	data, err := os.ReadFile(file) //nolint:gosec // a file in t.TempDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
 }
 
 func TestMapEditing(t *testing.T) {
