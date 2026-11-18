@@ -2,18 +2,21 @@ package tui
 
 import (
 	"fmt"
-	"strconv"
 	"strings"
 
 	"charm.land/lipgloss/v2"
 	"cuelang.org/go/cue"
+	"cuelang.org/go/cue/cuecontext"
+	"cuelang.org/go/cue/literal"
 
 	"github.com/Drathveloper/cuemenu/model"
 )
 
 const (
-	reservedRows = 9  // header, details and help around the menu
-	maxSummary   = 40 // longer list summaries show the count instead
+	reservedRows = 9   // header, details and help around the menu
+	maxSummary   = 40  // longer list summaries show the count instead
+	maxHint      = 100 // longer constraints are clipped
+	maxValue     = 40  // and longer values
 )
 
 func selStyle() lipgloss.Style  { return lipgloss.NewStyle().Reverse(true) }
@@ -116,7 +119,7 @@ func (m *Model) browseHelp() string {
 	switch {
 	case isList(cont):
 		return "a add  ⏎ edit  e edit as CUE  d delete  K/J move  s save  esc back"
-	case isMap(cont):
+	case takesFields(cont):
 		return "a add key  ⏎ open/edit  d delete entry  e edit as CUE  s save  esc back"
 	}
 	return "↑↓ ⏎ open/edit  space toggle  e edit as CUE  r reset  / search  s save  esc back  q quit"
@@ -136,7 +139,7 @@ func details(node *model.Node) string {
 		out.WriteString(node.Doc + "\n")
 	}
 	if node.Hint != "" {
-		out.WriteString(dimStyle().Render("Constraint: "+compact(node.Hint)) + "\n")
+		out.WriteString(dimStyle().Render("Constraint: "+Hint(node)) + "\n")
 	}
 	for _, msg := range node.Errors {
 		out.WriteString(errStyle().Render("⚠ "+msg) + "\n")
@@ -166,7 +169,7 @@ func entry(node *model.Node) string {
 	case model.Choice, model.Variant:
 		return fmt.Sprintf("    %s (%s)  --->", node.Label, val)
 	case model.ReadOnly:
-		return fmt.Sprintf("-*- %s = %s", node.Label, val)
+		return readOnlyEntry(node.Label, val)
 	case model.Number, model.Text, model.Expr:
 	}
 	if isElem(node) {
@@ -175,9 +178,28 @@ func entry(node *model.Node) string {
 	return fmt.Sprintf("(%s) %s", val, node.Label)
 }
 
-// shown is the value as displayed: unquoted, and hidden if secret.
+// Hint is the constraint of node on one line, clipped if too long: the
+// type of a list of structs can take thousands of characters.
+func Hint(node *model.Node) string { return clip(compact(node.Hint), maxHint) }
+
+func clip(text string, size int) string {
+	if runes := []rune(text); len(runes) > size {
+		return string(runes[:size-1]) + "…"
+	}
+	return text
+}
+
+func readOnlyEntry(label, val string) string {
+	if val == "" { // computed from fields not set yet
+		return fmt.Sprintf("-*- %s (computed)", label)
+	}
+	return fmt.Sprintf("-*- %s = %s", label, val)
+}
+
+// shown is the value as displayed: on one line, unquoted, and hidden if
+// secret.
 func shown(node *model.Node) string {
-	val := unquote(node.Value)
+	val := clip(compact(unquote(node.Value)), maxValue)
 	if node.Secret && val != "" {
 		return "****"
 	}
@@ -200,6 +222,9 @@ func markers(node *model.Node) string {
 
 // summary lists the elements of a list, or counts them if too long.
 func summary(list *model.Node) string {
+	if list.Value == "null" { // *null | [...T] left null
+		return list.Value
+	}
 	parts := make([]string, len(list.Children))
 	for idx, elem := range list.Children {
 		parts[idx] = compact(unquote(elem.Value))
@@ -235,9 +260,24 @@ func window(cursor, count, size int) (int, int) {
 	return lo, lo + size
 }
 
+// unquote is the text of a CUE string literal: "x", """multi-line""",
+// #"raw"#. Anything else is returned as is.
 func unquote(text string) string {
-	if plain, err := strconv.Unquote(text); err == nil {
+	if plain, err := literal.Unquote(text); err == nil {
 		return plain
+	}
+	return text
+}
+
+// oneLine writes CUE text on one line for the editor, which would turn line
+// breaks into spaces: a multi-line string escaped ("l1\nl2"), a struct or
+// a list as JSON, which is CUE too. Values reaching the editor are concrete.
+func oneLine(text string) string {
+	if !strings.Contains(text, "\n") {
+		return text
+	}
+	if data, err := cuecontext.New().CompileString(text).MarshalJSON(); err == nil {
+		return string(data)
 	}
 	return text
 }

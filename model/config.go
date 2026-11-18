@@ -115,8 +115,13 @@ func (c *Config) Unset(path cue.Path) {
 	c.prune()
 }
 
-// Tree is the menu tree of the current config.
-func (c *Config) Tree() []*Node {
+// Tree is the menu tree of the current config: the children of Root.
+func (c *Config) Tree() []*Node { return c.Root().Children }
+
+// Root is the node of the whole configuration, with an empty path. It is
+// a Menu, unless the package is something else at its top level: a map
+// ([string]: T) or a variant (#A | #B), as KubeVela's parameters can be.
+func (c *Config) Root() *Node {
 	full := c.Value()
 	errs := map[string][]string{}
 	for _, cerr := range cueerrors.Errors(full.Validate()) {
@@ -128,7 +133,10 @@ func (c *Config) Tree() []*Node {
 		key := cue.MakePath(sels...).String()
 		errs[key] = append(errs[key], cerr.Error())
 	}
-	return c.build(full, cue.Path{}, errs)
+	root := &Node{Label: "(root)", Errors: errs[""]}
+	classify(root, c.schema)
+	c.fill(root, full, c.schema, errs)
+	return root
 }
 
 // Load reads edits saved by Save. A missing file means no edits. Edits
@@ -273,6 +281,12 @@ func (c *Config) build(val cue.Value, parent cue.Path, errs map[string][]string)
 	}
 	var nodes []*Node
 	for iter.Next() {
+		// An optional field another definition closes out (#A & #B, only
+		// #A declares it) can never be set. Validate reports only such
+		// permanent errors, not a required field still missing.
+		if iter.Selector().ConstraintType() == cue.OptionalConstraint && iter.Value().Validate() != nil {
+			continue
+		}
 		nodes = append(nodes, c.buildNode(val, iter.Selector(), iter.Value(), parent, errs))
 	}
 	return nodes
@@ -301,8 +315,10 @@ func (c *Config) buildNode(
 // fill sets the value and children of node from fld, its edited value.
 func (c *Config) fill(node *Node, fld, decl cue.Value, errs map[string][]string) {
 	switch node.Widget {
-	case Menu, Map:
+	case Menu:
 		node.Children = c.build(fld, node.Path, errs)
+	case Map:
+		c.fillMap(node, fld, decl, errs)
 	case List:
 		node.Value = leafValue(fld)
 		node.Children, node.Elem = listItems(fld, decl, node.Path)
@@ -314,24 +330,20 @@ func (c *Config) fill(node *Node, fld, decl cue.Value, errs map[string][]string)
 }
 
 func (c *Config) fillVariant(node *Node, fld, decl cue.Value, errs map[string][]string) {
-	chosen := fld
-	if def, ok := fld.Default(); ok {
-		chosen = def
+	_, alts := expr(decl)
+	chosen, hasDefault := fld.Default()
+	if !hasDefault {
+		chosen = fld
 	}
+	// Without a default, nothing is chosen while several variants fit.
+	undecided := !hasDefault && compatible(fld, alts) > 1
 	node.Children = c.build(chosen, node.Path, errs)
 	if node.discr.String() != "" {
-		// The discriminator is where the variant is chosen.
-		node.Value, _ = chosen.LookupPath(node.discr).String()
-		for _, sub := range node.Children {
-			if sub.Label == node.discr.String() {
-				sub.Widget, sub.Options = Choice, quoteAll(node.Options)
-			}
-		}
+		c.fillDiscriminator(node, chosen, undecided)
 		return
 	}
 	// No discriminator: a synthetic first entry chooses the variant.
-	_, alts := decl.Expr()
-	if idx := chosenVariant(chosen, alts); idx >= 0 {
+	if idx := chosenVariant(chosen, alts); idx >= 0 && !undecided {
 		node.Value = node.Options[idx]
 	}
 	chooser := &Node{
@@ -340,6 +352,45 @@ func (c *Config) fillVariant(node *Node, fld, decl cue.Value, errs map[string][]
 		Doc: "Choose the variant. If it is told apart by a field, you will be asked for its value.",
 	}
 	node.Children = append([]*Node{chooser}, node.Children...)
+}
+
+// fillMap lists the entries of a map. The entries of a default
+// (*{k: v} | {[K]: T}) are concrete, but they can be changed: they are
+// edited with the map's pattern instead of being shown as fixed.
+func (c *Config) fillMap(node *Node, fld, decl cue.Value, errs map[string][]string) {
+	node.Children = c.build(fld, node.Path, errs)
+	mapVal, ok := defaultedMap(decl)
+	if !ok {
+		return
+	}
+	for _, entry := range node.Children {
+		if constraint, found := patternFor(mapVal, entry.Label); found && entry.Widget == ReadOnly {
+			value := entry.Value
+			classify(entry, constraint)
+			entry.Value = value
+		}
+	}
+}
+
+// fillDiscriminator makes the discriminator field the place where the
+// variant is chosen. While none is chosen the field does not exist yet in
+// the value, so it is added.
+func (c *Config) fillDiscriminator(node *Node, chosen cue.Value, undecided bool) {
+	if !undecided {
+		node.Value, _ = chosen.LookupPath(node.discr).String()
+	}
+	for _, sub := range node.Children {
+		if sub.Label == node.discr.String() {
+			sub.Widget, sub.Options = Choice, quoteAll(node.Options)
+			return
+		}
+	}
+	path := cue.MakePath(append(slices.Clone(node.Path.Selectors()), node.discr.Selectors()...)...)
+	discr := &Node{
+		Path: path, Label: node.discr.String(), Widget: Choice, Options: quoteAll(node.Options),
+		Doc: "Choose the variant.",
+	}
+	node.Children = append([]*Node{discr}, node.Children...)
 }
 
 // WriteFile replaces path atomically: the data is written to a temporary

@@ -13,6 +13,9 @@ import (
 // unresolved disjunction, e.g. the fields of a struct variant. An
 // alternative only counts if it still unifies with val.
 func find(val cue.Value, path cue.Path) (cue.Value, cue.Selector, bool) {
+	if len(path.Selectors()) == 0 { // the root
+		return val, cue.Selector{}, true
+	}
 	return findIn(val, path.Selectors(), true)
 }
 
@@ -85,7 +88,7 @@ func declaredOpen(val cue.Value) (cue.Value, bool) {
 
 // alternatives lists the disjuncts in val's expression, default first.
 func alternatives(val cue.Value) []cue.Value {
-	operator, args := val.Expr()
+	operator, args := expr(val)
 	if operator == cue.OrOp {
 		if def, ok := val.Default(); ok {
 			return append([]cue.Value{def}, args...)

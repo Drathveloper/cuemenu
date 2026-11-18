@@ -29,7 +29,7 @@ cuemenu help                                  # full help: commands, flags, edit
 | `space` | toggle a boolean |
 | `e` | edit any field as a CUE expression |
 | `r` | reset to the default value |
-| `a` `d` `K`/`J` | in lists and maps: add, delete, move |
+| `a` `d` `K`/`J` | in lists, maps and structs with `...`: add, delete, move |
 | `/` | search by name, path or documentation |
 | `s` `q` | save, quit (asks if there are unsaved changes) |
 
@@ -46,13 +46,14 @@ cuemenu help                                  # full help: commands, flags, edit
 | `#A \| #B` | variant: choosing one changes the fields |
 | computed or fixed field | read-only |
 | `if`, `for` | fields appear and disappear as values change |
+| a package that is `[string]: T` or `#A \| #B` at its top level | the top menu is that map or variant |
 | anything else | CUE expression editor |
 
 A field's documentation comes from its `//` comments. `@menu(secret)` hides the value on screen.
 
 ## Writing schemas
 
-- **Undeclared fields:** a regular struct only takes the fields it declares. To accept arbitrary fields, declare it with `...` or as `_`.
+- **Undeclared fields:** a regular struct only takes the fields it declares. To accept arbitrary fields, declare it with `...` (`a` then adds a field) or as `_`.
 - **Variants without a discriminator field:** use closed definitions (`#A | #B`). With open structs, CUE cannot tell which variant was chosen.
 - **Imports:** do not name a field like an import (`tls: tls.#Settings` hides the import); give the import an alias (`tlscfg "…/tls"`).
 

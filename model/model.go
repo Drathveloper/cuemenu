@@ -49,6 +49,7 @@ type Node struct {
 	Optional bool     // label?
 	Required bool     // label!
 	Chooser  bool     // Choice that picks a variant: use Config.Choose
+	Open     bool     // Menu declared with ...: Config.Entry adds fields
 }
 
 // Load evaluates the CUE package in dir, with its imports and module deps.
@@ -68,17 +69,23 @@ func Load(dir string) (cue.Value, error) {
 
 // classify decides the widget of a field from its unedited value.
 func classify(node *Node, decl cue.Value) {
-	op, args := decl.Expr()
+	op, args := expr(decl)
 	if op != cue.OrOp || !classifyDisjunction(node, flattenOr(args)) {
 		node.Widget = kindWidget(decl, kindOf(decl, op, args))
 	}
 	node.Hint = hint(node.Widget, decl)
+	if node.Widget == Menu {
+		_, node.Open = declaredOpen(decl)
+	}
 }
 
-// classifyDisjunction handles | of structs (variants) and of concrete
-// scalars (choices). Other disjunctions are classified by their kind.
+// classifyDisjunction handles | of structs (variants), of concrete scalars
+// (choices) and of lists with null (*null | [...T]: a list that may be
+// left null). Other disjunctions are classified by their kind.
 func classifyDisjunction(node *Node, alts []cue.Value) bool {
 	switch {
+	case hasMapAlt(alts):
+		node.Widget = Map
 	case all(alts, isStruct):
 		node.Widget = Variant
 		node.Options, node.discr = variantNames(alts)
@@ -87,10 +94,49 @@ func classifyDisjunction(node *Node, alts []cue.Value) bool {
 		for _, alt := range alts {
 			node.Options = append(node.Options, format(alt))
 		}
+	case all(alts, isNullOrList):
+		node.Widget = List
 	default:
 		return false
 	}
 	return true
+}
+
+// mapAlt returns the map of a map with default entries, such as Timoni's
+// nodeSelector: *{"kubernetes.io/os": "linux"} | {[string]: string}. It
+// is the one alternative with patterns; every other is a concrete struct
+// that fits in it. A default that does not fit keeps it a variant.
+func mapAlt(alts []cue.Value) (cue.Value, bool) {
+	idx := slices.IndexFunc(alts, func(alt cue.Value) bool { return len(patterns(alt)) > 0 })
+	if idx < 0 {
+		return cue.Value{}, false
+	}
+	for other, alt := range alts {
+		fits := isStruct(alt) && alt.IsConcrete() && len(patterns(alt)) == 0 && alt.Unify(alts[idx]).Err() == nil
+		if other != idx && !fits {
+			return cue.Value{}, false
+		}
+	}
+	return alts[idx], true
+}
+
+func hasMapAlt(alts []cue.Value) bool {
+	_, ok := mapAlt(alts)
+	return ok
+}
+
+// defaultedMap is the map alternative of decl, if decl is a map with
+// default entries.
+func defaultedMap(decl cue.Value) (cue.Value, bool) {
+	if op, args := expr(decl); op == cue.OrOp {
+		return mapAlt(flattenOr(args))
+	}
+	return cue.Value{}, false
+}
+
+func isNullOrList(val cue.Value) bool {
+	kind := val.IncompleteKind()
+	return kind == cue.NullKind || kind == cue.ListKind
 }
 
 func isStruct(val cue.Value) bool { return val.IncompleteKind() == cue.StructKind }
@@ -99,17 +145,72 @@ func isConstScalar(val cue.Value) bool {
 	return val.IsConcrete() && val.IncompleteKind()&(cue.StructKind|cue.ListKind) == 0
 }
 
-// kindOf is the kind of val. A validator such as list.MinItems(1) hides
-// it (bottom): then it is the intersection of the kinds of the conjuncts.
+// expr is val.Expr(), seeing through a reference into another package
+// (pkg.Name), which Expr reports as a selector instead of what it names.
+func expr(val cue.Value) (cue.Op, []cue.Value) {
+	operator, args := val.Expr()
+	if operator == cue.SelectorOp {
+		if root, path := val.ReferencePath(); len(path.Selectors()) > 0 {
+			return root.LookupPath(path).Expr()
+		}
+	}
+	if operator == cue.AndOp {
+		if alts, ok := embeddedOr(args); ok {
+			return cue.OrOp, alts
+		}
+	}
+	return operator, args
+}
+
+// embeddedOr finds the disjunction of a struct that only embeds one next
+// to definitions or lets, which declare no fields: at the top of a file,
+// "#A: {…}, #B: {…}, #A | #B" is {#A, #B} & (#A | #B).
+func embeddedOr(args []cue.Value) ([]cue.Value, bool) {
+	var alts []cue.Value
+	for _, arg := range args {
+		operator, sub := expr(arg)
+		switch {
+		case operator == cue.OrOp && alts == nil:
+			alts = sub
+		case operator != cue.OrOp && arg.IncompleteKind() == cue.StructKind && !declaresFields(arg):
+		default:
+			return nil, false
+		}
+	}
+	return alts, alts != nil
+}
+
+// declaresFields reports whether val has regular fields or patterns;
+// definitions, hidden fields and lets do not count.
+func declaresFields(val cue.Value) bool {
+	iter, err := val.Fields(cue.Optional(true), cue.Patterns(true))
+	return err == nil && iter.Next()
+}
+
+// kindOf is the kind of val. Two cases hide it (bottom): a validator such
+// as list.MinItems(1), then it is the intersection of the kinds of the
+// conjuncts; and a struct whose if tests a required field not yet set,
+// which still has fields.
 func kindOf(val cue.Value, op cue.Op, args []cue.Value) cue.Kind {
 	kind := val.IncompleteKind()
-	if kind == cue.BottomKind && op == cue.AndOp {
+	switch {
+	case kind != cue.BottomKind:
+	case op == cue.AndOp:
 		kind = cue.TopKind
 		for _, arg := range args {
 			kind &= arg.IncompleteKind()
 		}
+	case hasFields(val):
+		kind = cue.StructKind
 	}
 	return kind
+}
+
+// hasFields reports whether val lists at least one field. Fields alone
+// does not fail on a bottom scalar such as n + 1 with n unset.
+func hasFields(val cue.Value) bool {
+	iter, err := val.Fields(cue.All())
+	return err == nil && iter.Next()
 }
 
 func kindWidget(val cue.Value, kind cue.Kind) Widget {
@@ -122,12 +223,22 @@ func kindWidget(val cue.Value, kind cue.Kind) Widget {
 		return List
 	case val.IsConcrete():
 		return ReadOnly
+	}
+	return scalarWidget(kind)
+}
+
+func scalarWidget(kind cue.Kind) Widget {
+	switch {
 	case kind == cue.BoolKind:
 		return Toggle
 	case kind != 0 && kind&^cue.NumberKind == 0:
 		return Number
 	case kind == cue.StringKind:
 		return Text
+	case kind == cue.BottomKind:
+		// Computed from a required field not set yet: n + 1 with n!: int.
+		// Types and validators keep a kind while incomplete.
+		return ReadOnly
 	}
 	return Expr
 }
@@ -136,12 +247,20 @@ func kindWidget(val cue.Value, kind cue.Kind) Widget {
 func hint(widget Widget, decl cue.Value) string {
 	switch widget {
 	case Map:
+		if mapVal, ok := defaultedMap(decl); ok {
+			decl = mapVal
+		}
 		return strings.Join(patterns(decl), "\n")
 	case List:
 		if _, hasDefault := decl.Default(); decl.IsConcrete() && !hasDefault {
 			return ""
 		}
-	case Menu, Variant, ReadOnly:
+	case ReadOnly:
+		if !decl.IsConcrete() { // computed, waiting: show the formula
+			return format(decl)
+		}
+		return ""
+	case Menu, Variant:
 		return ""
 	case Toggle, Choice, Number, Text, Expr:
 	}
@@ -152,7 +271,7 @@ func hint(widget Widget, decl cue.Value) string {
 func flattenOr(args []cue.Value) []cue.Value {
 	var out []cue.Value
 	for _, arg := range args {
-		if op, sub := arg.Expr(); op == cue.OrOp {
+		if op, sub := expr(arg); op == cue.OrOp {
 			out = append(out, flattenOr(sub)...)
 		} else {
 			out = append(out, arg)

@@ -134,3 +134,16 @@ func TestHelp(t *testing.T) {
 		}
 	}
 }
+
+func TestTreeShowsRoot(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "s.cue"), []byte("package s\n\n[string]: string\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if code, out, _ := cli("tree", dir); code != exitOK || !strings.Contains(out, "(root)") || !strings.Contains(out, "map") {
+		t.Errorf("a map at the top must be shown: %d %q", code, out)
+	}
+	if _, out, _ := cli("tree", webapp(t, "")); strings.Contains(out, "(root)") {
+		t.Errorf("a plain root needs no line of its own: %q", out[:80])
+	}
+}

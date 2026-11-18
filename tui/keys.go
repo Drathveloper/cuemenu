@@ -23,7 +23,7 @@ const (
 
 const (
 	msgFixed = "Fixed or computed by the schema."
-	msgNoAdd = "Nothing to add here: only lists and maps take new items."
+	msgNoAdd = "Nothing to add here: only lists, maps and structs with ... take new items."
 	cueTrue  = "true"
 )
 
@@ -110,7 +110,7 @@ func (m *Model) add() tea.Cmd {
 	switch {
 	case isList(cont) && cont.Elem != nil:
 		m.addElem(cont)
-	case isMap(cont):
+	case takesFields(cont):
 		m.addEntry(cont)
 	default:
 		m.status = msgNoAdd
@@ -217,15 +217,22 @@ func (m *Model) editOrChoose(node *model.Node, set func(string) error) {
 	case node.Widget == model.ReadOnly:
 		m.status = msgFixed
 	default:
-		m.editWith(node, node.Widget != model.Text, m.valueCommit(node, set))
+		m.editWith(node, !plainText(node), m.valueCommit(node, set))
 	}
+}
+
+// plainText reports whether node is typed as text, without quotes. Text
+// that spans several lines is edited as a CUE string instead, escaped, so
+// the one-line editor does not lose its line breaks.
+func plainText(node *model.Node) bool {
+	return node.Widget == model.Text && !strings.Contains(node.Value, "\n")
 }
 
 // valueCommit applies typed text, to the field itself (set == nil) or
 // through set (a list element). Empty text resets a field to its default
 // and adds nothing to a list; a string is typed without quotes.
 func (m *Model) valueCommit(node *model.Node, set func(string) error) func(string) error {
-	asExpr := node.Widget != model.Text
+	asExpr := !plainText(node)
 	return func(text string) error {
 		switch {
 		case text == "" && set == nil && asExpr:
@@ -304,7 +311,9 @@ func (m *Model) editWith(node *model.Node, asExpr bool, commit func(string) erro
 			val = fmt.Sprint(current)
 		}
 	}
-	if !asExpr {
+	if asExpr {
+		val = oneLine(val)
+	} else {
 		val = unquote(val)
 	}
 	m.input.Reset()
@@ -372,7 +381,7 @@ func (m *Model) searchKey(msg tea.KeyPressMsg) tea.Cmd {
 	}
 	var cmd tea.Cmd
 	m.input, cmd = m.input.Update(msg)
-	m.results, m.opt = search(m.root, strings.ToLower(m.input.Value())), 0
+	m.results, m.opt = search(m.root.Children, strings.ToLower(m.input.Value())), 0
 	return cmd
 }
 
@@ -406,7 +415,7 @@ func rank(node *model.Node, query string) int {
 // jump opens the menu that holds node and puts the cursor on it.
 func (m *Model) jump(node *model.Node) {
 	m.stack = []frame{{}}
-	nodes := m.root
+	nodes := m.root.Children
 	sels := node.Path.Selectors()
 	for depth := range sels {
 		path := cue.MakePath(sels[:depth+1]...).String()

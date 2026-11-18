@@ -35,7 +35,7 @@ type Model struct {
 	file    string             // where Save writes
 	title   string             // shown in the header
 	status  string             // last message or error
-	root    []*model.Node      // the menu tree
+	root    *model.Node        // the menu tree: the whole configuration
 	stack   []frame            // open menus, root first
 	results []*model.Node      // searching: matches
 	input   textinput.Model    // editing / searching: the text typed
@@ -50,7 +50,7 @@ type Model struct {
 func New(cfg *model.Config, file, title string) *Model {
 	return &Model{
 		cfg: cfg, file: file, title: title,
-		root: cfg.Tree(), stack: []frame{{}}, input: textinput.New(),
+		root: cfg.Root(), stack: []frame{{}}, input: textinput.New(),
 	}
 }
 
@@ -104,7 +104,7 @@ func (m *Model) top() *frame { return &m.stack[len(m.stack)-1] }
 // items returns the current menu, dropping menus from the stack that no
 // longer exist (e.g. after choosing another variant).
 func (m *Model) items() []*model.Node {
-	nodes := m.root
+	nodes := m.root.Children
 	for depth, open := range m.stack[1:] {
 		node := byPath(nodes, open.path)
 		if node == nil {
@@ -125,10 +125,11 @@ func (m *Model) selected() *model.Node {
 	return items[m.top().cursor]
 }
 
-// container is the node whose children are the current menu (nil: root).
+// container is the node whose children are the current menu. At the top
+// it is the root, which can be a map or a variant too.
 func (m *Model) container() *model.Node {
-	nodes := m.root
-	var cont *model.Node
+	cont := m.root
+	nodes := cont.Children
 	for _, open := range m.stack[1:] {
 		if cont = byPath(nodes, open.path); cont == nil {
 			return nil
@@ -167,7 +168,7 @@ func (m *Model) changed() {
 		path = node.Path.String()
 	}
 	m.dirty = true
-	m.root = m.cfg.Tree()
+	m.root = m.cfg.Root()
 	items := m.items()
 	if idx := slices.IndexFunc(items, func(n *model.Node) bool { return n.Path.String() == path }); idx >= 0 {
 		m.top().cursor = idx
@@ -204,6 +205,9 @@ func byPath(nodes []*model.Node, path string) *model.Node {
 func isList(node *model.Node) bool { return node != nil && node.Widget == model.List }
 
 func isMap(node *model.Node) bool { return node != nil && node.Widget == model.Map }
+
+// takesFields: a map, or a struct declared with ..., gets new keys with a.
+func takesFields(node *model.Node) bool { return isMap(node) || node != nil && node.Open }
 
 func walk(nodes []*model.Node, visit func(*model.Node)) {
 	for _, node := range nodes {

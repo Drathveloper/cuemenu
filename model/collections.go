@@ -10,20 +10,38 @@ import (
 	"cuelang.org/go/cue/literal"
 )
 
-// Entry describes a new key for the map at mapPath, so the caller can ask
-// for its value. It fails if the key exists or no pattern accepts it.
+// Entry describes a new key for the map (or open struct) at mapPath, so
+// the caller can ask for its value. It fails if the key exists or no
+// pattern accepts it.
 func (c *Config) Entry(mapPath cue.Path, key string) (*Node, error) {
 	mapVal := c.Value().LookupPath(mapPath)
 	if mapVal.LookupPath(cue.MakePath(cue.Str(key))).Exists() {
 		return nil, fmt.Errorf("%w: %q", ErrKeyExists, key)
 	}
-	constraint, ok := patternFor(mapVal, key)
-	if !ok {
+	constraint, accepted := c.entryConstraint(mapPath, mapVal, key)
+	if !accepted {
 		return nil, fmt.Errorf("%w: %q %v", ErrKeyPattern, key, patterns(mapVal))
 	}
 	node := &Node{Path: child(mapPath, cue.Str(key)), Label: key, Doc: doc(constraint)}
 	classify(node, constraint)
 	return node, nil
+}
+
+// entryConstraint is what a new key of the map at mapPath must hold: a
+// pattern of the map, of the map behind a default (*{k: v} | {[K]: T}),
+// or anything if the struct was declared with ....
+func (c *Config) entryConstraint(mapPath cue.Path, mapVal cue.Value, key string) (cue.Value, bool) {
+	if constraint, found := patternFor(mapVal, key); found {
+		return constraint, true
+	}
+	if decl, _, found := find(c.without(mapPath), mapPath); found {
+		if defaulted, isDefaulted := defaultedMap(decl); isDefaulted {
+			if constraint, matched := patternFor(defaulted, key); matched {
+				return constraint, true
+			}
+		}
+	}
+	return declaredOpen(mapVal)
 }
 
 // SetList replaces the list at path with elems, each a CUE expression. An
@@ -72,7 +90,7 @@ func (c *Config) Choose(path cue.Path, idx int) (*Node, error) {
 // idx is one of them.
 func (c *Config) variants(path cue.Path, idx int) ([]cue.Value, error) {
 	decl, _, found := find(c.without(path), path)
-	op, alts := decl.Expr()
+	op, alts := expr(decl)
 	if !found || op != cue.OrOp || idx < 0 || idx >= len(alts) {
 		return nil, fmt.Errorf("%s: %w", path, ErrNotVariant)
 	}
@@ -137,7 +155,7 @@ func elemType(decl cue.Value) cue.Value {
 	if elem := decl.LookupPath(anyIndex); elem.Exists() {
 		return elem
 	}
-	_, args := decl.Expr()
+	_, args := expr(decl)
 	for _, arg := range args {
 		if elem := arg.LookupPath(anyIndex); elem.Exists() {
 			return elem
@@ -173,6 +191,17 @@ func ownFields(alts []cue.Value, idx int) []string {
 		}
 	}
 	return own
+}
+
+// compatible counts the alternatives val still unifies with.
+func compatible(val cue.Value, alts []cue.Value) int {
+	count := 0
+	for _, alt := range alts {
+		if val.Unify(alt).Err() == nil {
+			count++
+		}
+	}
+	return count
 }
 
 // chosenVariant is the first alternative val is still compatible with.

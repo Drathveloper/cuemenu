@@ -59,6 +59,14 @@ var matrix = []row{
 	{name: "nested enum", src: `a: *("x" | "y") | "z"`, path: "a", widget: model.Choice, set: `"z"`, want: `"z"`},
 	{name: "numeric enum", src: `a: 1 | 2 | *3`, path: "a", widget: model.Choice, set: `2`, want: `2`},
 	{name: "null or int", src: `a: *null | int`, path: "a", widget: model.Expr, set: `5`, want: `5`},
+	{name: "null or list", src: `a: *null | [...string]`, path: "a", widget: model.List, want: `null`},
+	{name: "null or list set", src: `a: *null | [...string]`, path: "a", widget: model.List, set: `["x"]`, want: `["x"]`},
+	{name: "null or list rejects kind", src: `a: *null | [...string]`, path: "a", widget: model.List, set: `[1]`, reject: true},
+	{name: "map with default", src: `a: *{x: "1"} | {[string]: string}`, path: "a", widget: model.Map, want: `{"x":"1"}`},
+	{name: "map with default adds key", src: `a: *{x: "1"} | {[string]: string}`, path: "a", widget: model.Map, setPath: "a.y", set: `"2"`, wantPath: "a", want: `{"x":"1","y":"2"}`},
+	{name: "map with default: entry editable", src: `a: *{x: "1"} | {[string]: string}`, path: "a.x", widget: model.Text, set: `"3"`, wantPath: "a", want: `{"x":"3"}`},
+	{name: "map with default: CUE accepts through the open default", src: `a: *{x: "1"} | {[string]: string}`, path: "a", widget: model.Map, setPath: "a.y", set: `2`, wantPath: "a", want: `{"x":"1","y":2}`},
+	{name: "default outside the map: variant", src: `a: *{kind: "x"} | close({[=~"^y"]: int})`, path: "a", widget: model.Variant},
 	{name: "variant with discriminator", src: `a: *{kind: "x", x: int | *1} | {kind: "y", y: int | *2}`, path: "a", widget: model.Variant, setPath: "a.kind", set: `"y"`, want: `{"kind":"y","y":2}`},
 	{name: "embedded variant", src: "#A: {kind: \"a\", x: int | *1}\n#B: {kind: \"b\", y: int | *2}\na: {#A | #B}", path: "a", widget: model.Variant},
 
@@ -76,6 +84,8 @@ var matrix = []row{
 	{name: "optional", src: `a?: int`, path: "a", widget: model.Number, set: `3`, want: `3`},
 	{name: "required", src: `a!: int`, path: "a", widget: model.Number, set: `3`, want: `3`},
 
+	{name: "closed out by another definition", src: "#A: {x?: int, y?: int}\n#B: {x?: int}\na: #A & #B", path: "a.y", widget: ""},
+	{name: "kept by both definitions", src: "#A: {x?: int, y?: int}\n#B: {x?: int}\na: #A & #B", path: "a.x", widget: model.Number, set: `1`, want: `1`},
 	{name: "split declarations", src: "a: {x: int | *1}\na: {y: int | *2}", path: "a.y", widget: model.Number, wantPath: "a", want: `{"x":1,"y":2}`},
 	{name: "optional with default", src: `a?: int | *1`, path: "a", widget: model.Number, set: `4`, want: `4`},
 
@@ -94,6 +104,12 @@ var matrix = []row{
 	{name: "arithmetic", src: "a: int | *2\nb: a * 2", path: "b", widget: model.ReadOnly, setPath: "a", set: `3`, wantPath: "b", want: `6`},
 	{name: "interpolation", src: "h: string | *\"x\"\nu: \"http://\\(h)/\"", path: "u", widget: model.ReadOnly, setPath: "h", set: `"y"`, wantPath: "u", want: `"http://y/"`},
 	{name: "if", src: "on: bool | *false\nif on {extra: int | *1}", path: "extra", widget: "", setPath: "on", set: `true`, wantPath: "extra", want: `1`},
+	{name: "if on a required field", src: "a: {r!: string, ref: string, if r != \"\" {ref: r}}", path: "a", widget: model.Menu, setPath: "a.r", set: `"x"`, wantPath: "a", want: `{"r":"x","ref":"x"}`},
+	{name: "computed, input not set", src: "n!: int\nsum: n + 1", path: "sum", widget: model.ReadOnly},
+	{name: "computed interpolation, input not set", src: "r!: string\nup: \"x\\(r)\"", path: "up", widget: model.ReadOnly},
+	{name: "computed reference, input not set", src: "name!: string\nlabel: name", path: "label", widget: model.ReadOnly, setPath: "name", set: `"web"`, wantPath: "label", want: `"web"`},
+	{name: "computed call, input not set", src: "import \"strings\"\nname!: string\nup: strings.ToUpper(name)", path: "up", widget: model.ReadOnly},
+	{name: "type reference stays editable", src: "Mode: string\na: Mode", path: "a", widget: model.Text, set: `"x"`, want: `"x"`},
 	{name: "for", src: "src: [...string] | *[\"a\"]\nout: {for x in src {(x): {enabled: bool | *false}}}", path: "out.a.enabled", widget: model.Toggle, setPath: "src", set: `["a", "b"]`, wantPath: "out.b", want: `{"enabled":false}`},
 
 	// --- Lists ---

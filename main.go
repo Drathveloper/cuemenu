@@ -137,7 +137,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	}
 	switch opts.cmd {
 	case cmdTree:
-		printTree(stdout, cfg.Tree(), 0)
+		printRoot(stdout, cfg.Root())
 		return exitOK
 	case cmdCheck:
 		return app.check(cfg)
@@ -313,10 +313,24 @@ func hasSecret(nodes []*model.Node) bool {
 	return false
 }
 
+// printRoot prints the tree, with a line for the root itself when it is
+// not a plain menu: a map, a variant or a struct with ....
+func printRoot(out io.Writer, root *model.Node) {
+	if root.Widget == model.Menu && !root.Open {
+		printTree(out, root.Children, 0)
+		return
+	}
+	hint := tui.Hint(root)
+	if root.Open {
+		hint = "..."
+	}
+	sayf(out, "%-60s %-8s %s\n", root.Label, root.Widget, hint)
+	printTree(out, root.Children, 1)
+}
+
 func printTree(out io.Writer, nodes []*model.Node, depth int) {
 	for _, node := range nodes {
-		sayf(out, "%s%-60s %-8s %s\n", strings.Repeat("    ", depth), tui.Line(node), node.Widget,
-			strings.Join(strings.Fields(node.Hint), " "))
+		sayf(out, "%s%-60s %-8s %s\n", strings.Repeat("    ", depth), tui.Line(node), node.Widget, tui.Hint(node))
 		printTree(out, node.Children, depth+1)
 	}
 }

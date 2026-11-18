@@ -416,3 +416,179 @@ func TestVariantWithoutDiscriminator(t *testing.T) {
 		t.Errorf("Choose with discriminator: %v", err)
 	}
 }
+
+func TestImportedReferences(t *testing.T) {
+	v, err := model.Load("testdata/imports")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := model.New(v)
+	got := tree(c)
+	if n := got["mode"]; n == nil || n.Widget != model.Choice || len(n.Options) != 3 {
+		t.Errorf("imported enum: %+v", n)
+	}
+	if n := got["legend.display"]; n == nil || n.Widget != model.Choice {
+		t.Errorf("enum referenced inside the imported package: %+v", n)
+	}
+	if n := got["variant"]; n == nil || n.Widget != model.Variant {
+		t.Fatalf("imported variant: %+v", n)
+	}
+	if _, err := c.Choose(cue.ParsePath("variant"), 1); err != nil || tree(c)["variant"].Value != "b" {
+		t.Errorf("choose imported variant: %v", err)
+	}
+}
+
+func compile(t *testing.T, src string) *model.Config {
+	t.Helper()
+	v := cuecontext.New().CompileString(src)
+	if err := v.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return model.New(v)
+}
+
+func exportJSON(t *testing.T, c *model.Config) string {
+	t.Helper()
+	out, err := c.Export("json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.Join(strings.Fields(string(out)), "")
+}
+
+// The top level of a package need not be a struct with fields: KubeVela's
+// parameters are maps, variants or open structs.
+func TestRootMap(t *testing.T) {
+	c := compile(t, `[string]: string | null`)
+	if root := c.Root(); root.Widget != model.Map || root.Path.String() != "" {
+		t.Fatalf("root: %+v", root)
+	}
+	entry, err := c.Entry(cue.Path{}, "app")
+	if err != nil || entry.Path.String() != "app" {
+		t.Fatalf("entry: %+v %v", entry, err)
+	}
+	if err := c.SetExpr(entry.Path, `"web"`); err != nil {
+		t.Fatal(err)
+	}
+	if got := exportJSON(t, c); got != `{"app":"web"}` {
+		t.Errorf("export: %s", got)
+	}
+	file := t.TempDir() + "/.config.cue"
+	if err := c.Save(file); err != nil {
+		t.Fatal(err)
+	}
+	again := compile(t, `[string]: string | null`)
+	if _, err := again.Load(file); err != nil || tree(again)["app"] == nil {
+		t.Errorf("reload: %v %v", err, again.EditKeys())
+	}
+	c.Unset(cue.Path{}) // reset everything
+	if len(c.EditKeys()) != 0 {
+		t.Errorf("unset root: %v", c.EditKeys())
+	}
+}
+
+func TestRootVariant(t *testing.T) {
+	// Definitions next to the embedded disjunction: {#A, #B} & (#A | #B).
+	c := compile(t, "#A: {kind: \"a\", x: int | *1}\n#B: {kind: \"b\", y: int | *2}\n#A | #B")
+	if root := c.Root(); root.Widget != model.Variant || len(root.Options) != 2 {
+		t.Fatalf("root: %+v", root)
+	}
+	if _, err := c.Choose(cue.Path{}, 1); err != nil {
+		t.Fatal(err)
+	}
+	if got := exportJSON(t, c); got != `{"kind":"b","y":2}` {
+		t.Errorf("export: %s", got)
+	}
+
+	// No discriminator (KubeVela's container-image): a chooser comes first,
+	// and choosing asks for the field only that variant has.
+	c = compile(t, "#P: {image: string, name: *\"\" | string}\n#P | close({containers: [...#P]})")
+	root := c.Root()
+	if root.Widget != model.Variant || len(root.Children) == 0 || !root.Children[0].Chooser {
+		t.Fatalf("root: %+v", root)
+	}
+	ask, err := c.Choose(cue.Path{}, 1)
+	if err != nil || ask == nil || ask.Path.String() != "containers" {
+		t.Fatalf("choose: %+v %v", ask, err)
+	}
+	if err := c.SetExpr(ask.Path, `[{image: "nginx"}]`); err != nil {
+		t.Fatal(err)
+	}
+	if got := exportJSON(t, c); got != `{"containers":[{"image":"nginx","name":""}]}` {
+		t.Errorf("export: %s", got)
+	}
+}
+
+// A struct with ... takes fields it does not declare, at the root or below.
+func TestOpenStruct(t *testing.T) {
+	c := compile(t, `...`)
+	if root := c.Root(); root.Widget != model.Menu || !root.Open {
+		t.Fatalf("root: %+v", root)
+	}
+	entry, err := c.Entry(cue.Path{}, "x")
+	if err != nil || entry.Widget != model.Expr {
+		t.Fatalf("entry: %+v %v", entry, err)
+	}
+	if err := c.SetExpr(entry.Path, `{y: 1}`); err != nil {
+		t.Fatal(err)
+	}
+	if got := exportJSON(t, c); got != `{"x":{"y":1}}` {
+		t.Errorf("export: %s", got)
+	}
+
+	c = compile(t, "a: {b: int | *1, ...}\nclosed: {b: int | *1}")
+	got := tree(c)
+	if !got["a"].Open || got["closed"].Open || c.Root().Open {
+		t.Errorf("open: a=%v closed=%v root=%v", got["a"].Open, got["closed"].Open, c.Root().Open)
+	}
+	if _, err := c.Entry(cue.ParsePath("closed"), "x"); err == nil {
+		t.Error("a struct without ... takes no new fields")
+	}
+}
+
+// A variant without default is not chosen yet: nothing is shown as chosen,
+// and with a discriminator that field is where it is chosen.
+func TestVariantWithoutDefault(t *testing.T) {
+	c := compile(t, "#P: {image: string}\na: #P | close({containers: [...#P]})\nb: {kind: \"x\", x: int | *1} | {kind: \"y\", y: int | *2}")
+	got := tree(c)
+	if got["a"].Value != "" || got["a"].Children[0].Value != "" {
+		t.Errorf("undiscriminated: %q / chooser %q", got["a"].Value, got["a"].Children[0].Value)
+	}
+	kind := got["b.kind"]
+	if kind == nil || kind.Widget != model.Choice || len(kind.Options) != 2 || kind.Value != "" {
+		t.Fatalf("discriminator to choose with: %+v", kind)
+	}
+	if err := c.SetExpr(kind.Path, `"y"`); err != nil {
+		t.Fatal(err)
+	}
+	if got := tree(c); got["b"].Value != "y" || got["b.y"] == nil {
+		t.Errorf("after choosing: %q %v", got["b"].Value, got["b.y"])
+	}
+
+	// Same at the top of the package.
+	c = compile(t, "#A: {kind: \"a\", x: int | *1}\n#B: {kind: \"b\", y: int | *2}\n#A | #B")
+	if kind := tree(c)["kind"]; kind == nil || kind.Widget != model.Choice || kind.Value != "" {
+		t.Errorf("root discriminator: %+v", kind)
+	}
+}
+
+// Timoni's nodeSelector: a map whose default has entries.
+func TestMapWithDefault(t *testing.T) {
+	c := compile(t, `nodeSelector: *{"kubernetes.io/os": "linux"} | {[string]: string}`)
+	n := tree(c)["nodeSelector"]
+	if n.Widget != model.Map || n.Hint != "[string]: string" || len(n.Children) != 1 {
+		t.Fatalf("map with default: %+v", n)
+	}
+	entry, err := c.Entry(n.Path, "disk")
+	if err != nil || entry.Widget != model.Text {
+		t.Fatalf("entry: %+v %v", entry, err)
+	}
+}
+
+// A computed field waiting for its inputs shows the formula as its hint.
+func TestComputedHint(t *testing.T) {
+	n := tree(compile(t, "n!: int\nsum: n + 1"))["sum"]
+	if n.Widget != model.ReadOnly || n.Value != "" || n.Hint != "n + 1" {
+		t.Errorf("computed: %+v", n)
+	}
+}
