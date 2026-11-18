@@ -15,6 +15,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"slices"
 	"strings"
 
@@ -34,13 +35,20 @@ const usage = `usage:
 DIR is a CUE package (default "."). Changes are saved in DIR/.config.cue.
 `
 
-// Build information, set by `make build` with -ldflags -X.
+// Values of the build information when nothing sets them.
+const (
+	devVersion = "dev"
+	unknown    = "unknown"
+)
+
+// Build information, set by `make build` with -ldflags -X. When it is not
+// set, buildInfo falls back on what Go embeds in the binary.
 //
 //nolint:gochecknoglobals // -X can only set package-level variables
 var (
-	Version   = "dev"
-	Commit    = "unknown"
-	BuildTime = "unknown"
+	Version   = devVersion
+	Commit    = unknown
+	BuildTime = unknown
 )
 
 // Exit codes.
@@ -70,7 +78,9 @@ func main() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr)) }
 func run(args []string, stdout, stderr io.Writer) int {
 	app := cliApp{stdout: stdout, stderr: stderr}
 	if len(args) == 1 && args[0] == "version" {
-		sayf(stdout, "cuemenu %s (commit %s, built %s)\n", Version, Commit, BuildTime)
+		info, ok := debug.ReadBuildInfo()
+		build := buildInfo(info, ok)
+		sayf(stdout, "cuemenu %s (commit %s, built %s)\n", build.version, build.commit, build.time)
 		return exitOK
 	}
 	opts, ok := parseArgs(args)
@@ -195,6 +205,32 @@ func (app cliApp) edit(cfg *model.Config, dir string) int {
 }
 
 func configFile(dir string) string { return filepath.Join(dir, ".config.cue") }
+
+type build struct {
+	version, commit, time string
+}
+
+// buildInfo completes what -ldflags did not set with the data Go embeds:
+// `go install module@version` records the module version, and `go build`
+// in a git checkout records the commit and its time.
+func buildInfo(info *debug.BuildInfo, ok bool) build {
+	out := build{version: Version, commit: Commit, time: BuildTime}
+	if !ok {
+		return out
+	}
+	if out.version == devVersion && info.Main.Version != "" && info.Main.Version != "(devel)" {
+		out.version = info.Main.Version
+	}
+	for _, setting := range info.Settings {
+		if setting.Key == "vcs.revision" && out.commit == unknown {
+			out.commit = setting.Value
+		}
+		if setting.Key == "vcs.time" && out.time == unknown {
+			out.time = setting.Value
+		}
+	}
+	return out
+}
 
 // sayf writes to stdout or stderr: if that fails there is nowhere to report.
 func sayf(out io.Writer, format string, args ...any) {
