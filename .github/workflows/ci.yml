@@ -14,7 +14,8 @@ jobs:
 
   # Every push to master that passes the checks becomes a release: the
   # patch version goes up, or the minor/major one if a pushed commit
-  # message contains #minor or #major.
+  # message has a line that is just "#minor" or "#major" (a mention in
+  # the middle of a sentence does not count).
   release:
     needs: checks
     if: github.event_name == 'push'
@@ -45,11 +46,13 @@ jobs:
             version=${previous#v}
             IFS=. read -r major minor patch <<< "${version:-0.0.0}"
             messages=$(git log --format=%B "${previous:+$previous..}HEAD")
-            case "$messages" in
-              *'#major'*) major=$((major + 1)); minor=0; patch=0 ;;
-              *'#minor'*) minor=$((minor + 1)); patch=0 ;;
-              *) patch=$((patch + 1)) ;;
-            esac
+            if grep -qxE '[[:space:]]*#major[[:space:]]*' <<< "$messages"; then
+              major=$((major + 1)); minor=0; patch=0
+            elif grep -qxE '[[:space:]]*#minor[[:space:]]*' <<< "$messages"; then
+              minor=$((minor + 1)); patch=0
+            else
+              patch=$((patch + 1))
+            fi
             tag="v$major.$minor.$patch"
             git config user.name "github-actions[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
