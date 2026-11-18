@@ -125,3 +125,12 @@ func TestBuildInfo(t *testing.T) {
 		t.Errorf("ldflags should win: %+v", got)
 	}
 }
+
+func TestHelp(t *testing.T) {
+	for _, args := range [][]string{{"help"}, {"-h"}, {"--help"}, {"export", "-h"}, {"check", ".", "--help"}} {
+		code, out, errs := cli(args...)
+		if code != exitOK || !strings.Contains(out, "Editor keys:") || !strings.Contains(out, "usage:") || errs != "" {
+			t.Errorf("%v: code %d, stdout %d bytes, stderr %q", args, code, len(out), errs)
+		}
+	}
+}

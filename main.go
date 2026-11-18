@@ -5,11 +5,13 @@
 //	cuemenu check DIR                                exit 1 if incomplete
 //	cuemenu export [-f json|yaml] [-o FILE] DIR      final configuration
 //	cuemenu version                                  build information
+//	cuemenu help                                     how to use it
 //
 // DIR is a CUE package. The user's edits live in DIR/.config.cue.
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -31,9 +33,49 @@ const usage = `usage:
   cuemenu check DIR                             check it is complete (exit code 1 if not)
   cuemenu export [-f json|yaml] [-o FILE] DIR   write the final configuration
   cuemenu version                               version, commit and build date
+  cuemenu help                                  this help (also -h, --help)
 
 DIR is a CUE package (default "."). Changes are saved in DIR/.config.cue.
 `
+
+const help = `cuemenu: a menuconfig-style editor for CUE configurations. It turns a CUE
+schema into menus, validates every value as you type and writes the final
+configuration as JSON or YAML.
+
+` + usage + `
+Commands:
+  (none)    Open the editor on DIR. Changes are kept in DIR/.config.cue,
+            which holds only the values you changed.
+  tree      Print the menu tree with the control of each field, without the UI.
+  check     List what is missing and exit with code 1 if the configuration
+            is incomplete. Meant for CI.
+  export    Print the final configuration, or write it to a file with -o.
+  version   Print the version, commit and build date.
+  help      Print this help.
+
+Export flags (before or after DIR):
+  -f json|yaml   Output format. Default: from the extension of -o, else json.
+  -o FILE        Write to FILE instead of the standard output. The file is
+                 replaced atomically, with mode 0600 if it holds a secret.
+
+Editor keys:
+  ↑ ↓  k j       Move.
+  ⏎  → l         Open a menu, edit a field, choose an option.
+  esc  ← h       Go back; at the top, quit.
+  space          Toggle a boolean.
+  e              Edit any field as a CUE expression.
+  r              Reset a field to its default.
+  a  d  K J      In lists and maps: add, delete, move up and down.
+  /              Search by name, path or documentation.
+  s  q           Save, quit (asks if there are unsaved changes).
+
+Exit codes: 0 ok, 1 error or incomplete configuration, 2 bad usage.
+
+More: https://github.com/Drathveloper/cuemenu
+`
+
+// errUsage reports command-line arguments that make no sense.
+var errUsage = errors.New("bad usage")
 
 // Values of the build information when nothing sets them.
 const (
@@ -77,14 +119,15 @@ func main() { os.Exit(run(os.Args[1:], os.Stdout, os.Stderr)) }
 // run executes the command line and returns the exit code.
 func run(args []string, stdout, stderr io.Writer) int {
 	app := cliApp{stdout: stdout, stderr: stderr}
-	if len(args) == 1 && args[0] == "version" {
-		info, ok := debug.ReadBuildInfo()
-		build := buildInfo(info, ok)
-		sayf(stdout, "cuemenu %s (commit %s, built %s)\n", build.version, build.commit, build.time)
+	if about(args, stdout) {
 		return exitOK
 	}
-	opts, ok := parseArgs(args)
-	if !ok {
+	opts, err := parseArgs(args)
+	switch {
+	case errors.Is(err, flag.ErrHelp): // -h, -help, --help
+		sayf(stdout, "%s", help)
+		return exitOK
+	case err != nil:
 		sayf(stderr, "%s", usage)
 		return exitUsage
 	}
@@ -104,6 +147,25 @@ func run(args []string, stdout, stderr io.Writer) int {
 	return app.edit(cfg, opts.dir)
 }
 
+// about runs the commands that only tell about cuemenu itself: version
+// and help. It reports whether args was one of them.
+func about(args []string, stdout io.Writer) bool {
+	if len(args) != 1 {
+		return false
+	}
+	switch args[0] {
+	case "version":
+		info, ok := debug.ReadBuildInfo()
+		build := buildInfo(info, ok)
+		sayf(stdout, "cuemenu %s (commit %s, built %s)\n", build.version, build.commit, build.time)
+		return true
+	case "help":
+		sayf(stdout, "%s", help)
+		return true
+	}
+	return false
+}
+
 type options struct {
 	cmd    string
 	dir    string
@@ -113,7 +175,7 @@ type options struct {
 
 // parseArgs reads [SUBCOMMAND] [flags] [DIR] [flags]: flags may come
 // before or after DIR, so `cuemenu export . -o app.yaml` works.
-func parseArgs(args []string) (options, bool) {
+func parseArgs(args []string) (options, error) {
 	opts := options{cmd: cmdEdit, dir: "."}
 	if len(args) > 0 && slices.Contains([]string{cmdTree, cmdCheck, cmdExport}, args[0]) {
 		opts.cmd, args = args[0], args[1:]
@@ -127,8 +189,13 @@ func parseArgs(args []string) (options, bool) {
 		opts.dir = flags.Arg(0)
 		err = flags.Parse(flags.Args()[1:])
 	}
-	onlyExport := opts.cmd == cmdExport || opts.out == "" && opts.format == ""
-	return opts, err == nil && flags.NArg() == 0 && onlyExport
+	if err != nil {
+		return opts, fmt.Errorf("%w: %w", errUsage, err)
+	}
+	if flags.NArg() > 0 || opts.cmd != cmdExport && (opts.out != "" || opts.format != "") {
+		return opts, errUsage
+	}
+	return opts, nil
 }
 
 // cliApp runs the subcommands; each prints its own errors and returns

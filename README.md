@@ -14,6 +14,7 @@ cuemenu tree DIR                              # print the menu tree, no UI
 cuemenu check DIR                             # exit code 1 if anything is missing (for CI)
 cuemenu export [-f json|yaml] [-o FILE] DIR   # write the final configuration
 cuemenu version                               # version, commit and build date
+cuemenu help                                  # full help: commands, flags, editor keys (also -h)
 ```
 
 - **Where changes go:** `DIR/.config.cue` holds only what you changed; everything else comes from the schema defaults, like the kernel's `.config`. CUE ignores files starting with `.`, so it never interferes with the package.
