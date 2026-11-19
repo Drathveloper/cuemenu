@@ -8,6 +8,10 @@ require (
 	charm.land/lipgloss/v2 v2.1.1
 	cuelang.org/go v0.17.1
 	github.com/go-playground/validator/v10 v10.30.6
+	github.com/knadh/koanf/parsers/yaml v1.1.1
+	github.com/knadh/koanf/providers/env/v2 v2.0.2
+	github.com/knadh/koanf/providers/rawbytes v1.0.1
+	github.com/knadh/koanf/v2 v2.4.1
 	go.yaml.in/yaml/v3 v3.0.4
 )
 
@@ -27,11 +31,15 @@ require (
 	github.com/gabriel-vasile/mimetype v1.4.16 // indirect
 	github.com/go-playground/locales v0.14.2 // indirect
 	github.com/go-playground/universal-translator v0.18.2 // indirect
+	github.com/go-viper/mapstructure/v2 v2.4.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
+	github.com/knadh/koanf/maps v0.1.2 // indirect
 	github.com/leodido/go-urn v1.5.0 // indirect
 	github.com/lucasb-eyer/go-colorful v1.4.1 // indirect
 	github.com/mattn/go-runewidth v0.0.30 // indirect
+	github.com/mitchellh/copystructure v1.2.0 // indirect
 	github.com/mitchellh/go-wordwrap v1.0.1 // indirect
+	github.com/mitchellh/reflectwalk v1.0.2 // indirect
 	github.com/muesli/cancelreader v0.2.2 // indirect
 	github.com/opencontainers/go-digest v1.0.0 // indirect
 	github.com/opencontainers/image-spec v1.1.1 // indirect

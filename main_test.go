@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"runtime/debug"
 	"strings"
 	"testing"
 )
@@ -96,33 +95,6 @@ func TestUsage(t *testing.T) {
 func TestVersion(t *testing.T) {
 	if code, out, _ := cli("version"); code != 0 || !strings.HasPrefix(out, "cuemenu dev") {
 		t.Errorf("version: %d %q", code, out)
-	}
-}
-
-func TestBuildInfo(t *testing.T) {
-	installed := &debug.BuildInfo{Main: debug.Module{Version: "v0.1.0"}}
-	if got := buildInfo(installed, true); got.version != "v0.1.0" || got.commit != unknown {
-		t.Errorf("go install: %+v", got)
-	}
-	checkout := &debug.BuildInfo{
-		Main: debug.Module{Version: "(devel)"},
-		Settings: []debug.BuildSetting{
-			{Key: "vcs.revision", Value: "abc123"},
-			{Key: "vcs.time", Value: "2026-11-18T19:00:00Z"},
-		},
-	}
-	if got := buildInfo(checkout, true); got.version != devVersion || got.commit != "abc123" || got.time != "2026-11-18T19:00:00Z" {
-		t.Errorf("go build in a checkout: %+v", got)
-	}
-	if got := buildInfo(nil, false); got.version != devVersion {
-		t.Errorf("no build info: %+v", got)
-	}
-
-	// Values set by make build (-ldflags -X) win.
-	defer func(v, c string) { Version, Commit = v, c }(Version, Commit)
-	Version, Commit = "v9.9.9", "fromldflags"
-	if got := buildInfo(checkout, true); got.version != "v9.9.9" || got.commit != "fromldflags" {
-		t.Errorf("ldflags should win: %+v", got)
 	}
 }
 

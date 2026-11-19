@@ -23,6 +23,7 @@ func TestRun(t *testing.T) {
 		code   int
 	}{
 		{name: "help", args: []string{"-h"}, stderr: usageHead, code: exitOK},
+		{name: "version", args: []string{"-version"}, stdout: "cuegen dev", code: exitOK},
 		{name: "bad flag", args: []string{"-nope"}, stderr: usageHead, code: exitUsage},
 		{name: "two dirs", args: []string{"a", "b"}, stderr: usageHead, code: exitUsage},
 		{name: "no package", args: []string{t.TempDir()}, stderr: "cuegen:", code: exitFail},

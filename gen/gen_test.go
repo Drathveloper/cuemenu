@@ -20,7 +20,7 @@ func TestExampleUpToDate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	src, _, err := gen.Generate(schema, gen.Options{Package: "config", Type: rootType})
+	src, _, err := gen.Generate(schema, gen.Options{Package: "config", Type: rootType, Koanf: true})
 	if err != nil {
 		t.Fatal(err)
 	}

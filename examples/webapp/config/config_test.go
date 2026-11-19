@@ -3,11 +3,16 @@ package config_test
 import (
 	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 
 	"cuelang.org/go/cue"
 	"cuelang.org/go/cue/cuecontext"
 	"cuelang.org/go/cue/load"
+	kyaml "github.com/knadh/koanf/parsers/yaml"
+	"github.com/knadh/koanf/providers/env/v2"
+	"github.com/knadh/koanf/providers/rawbytes"
+	"github.com/knadh/koanf/v2"
 
 	"github.com/Drathveloper/cuemenu/examples/webapp/config"
 )
@@ -185,4 +190,74 @@ func TestYAML(t *testing.T) {
 	if want := config.NewConfig(); err != nil || !reflect.DeepEqual(*empty, want) {
 		t.Fatalf("%v: %+v", err, empty)
 	}
+}
+
+// Load takes what koanf merges, a file and the secrets in environment
+// variables here, as ParseJSON takes the same configuration in JSON.
+func TestKoanf(t *testing.T) {
+	t.Parallel()
+	const file = "database:\n  type: postgres\n  user: app\n" +
+		"cache:\n  redis:\n    addr: localhost:6379\n" +
+		"auth:\n  oauth2:\n    gh:\n      client_id: id\n"
+	const secrets = "WEBAPP_DATABASE__PASSWORD=p WEBAPP_AUTH__OAUTH2__GH__CLIENT_SECRET=s" //nolint:gosec // fake secrets of the test
+	tests := []struct {
+		name    string
+		want    string // JSON; "" if Load must fail
+		environ []string
+	}{
+		{
+			name: "secrets and numbers from the environment",
+			environ: []string{
+				"WEBAPP_DATABASE__PASSWORD=s3cret", "WEBAPP_DATABASE__PORT=6543",
+				"WEBAPP_AUTH__OAUTH2__GH__CLIENT_SECRET=gh-secret", "WEBAPP_AUTH__ADMINS=root, ops",
+				"WEBAPP_SERVER__HTTP_PORT=9090", "WEBAPP_SERVER__ENABLE_GZIP=true", "WEBAPP_CACHE__REDIS__DB=2",
+				"OTHER_VAR=ignored",
+			},
+			want: `{"database": {"type": "postgres", "user": "app", "password": "s3cret", "port": 6543},
+				"cache": {"redis": {"addr": "localhost:6379", "db": 2}},
+				"auth": {"admins": ["root", "ops"], "oauth2": {"gh": {"client_id": "id", "client_secret": "gh-secret"}}},
+				"server": {"http_port": 9090, "enable_gzip": true}}`,
+		},
+		{
+			name:    "the environment wins over the file",
+			environ: strings.Fields(secrets + " WEBAPP_DATABASE__USER=env"),
+			want: `{"database": {"type": "postgres", "user": "env", "password": "p"},
+				"cache": {"redis": {"addr": "localhost:6379"}}, "auth": {"oauth2": {"gh": {"client_id": "id", "client_secret": "s"}}}}`,
+		},
+		{name: "a secret missing", environ: strings.Fields(secrets)[1:]},
+		{name: "not a number", environ: strings.Fields(secrets + " WEBAPP_DATABASE__PORT=abc")},
+		{name: "out of range", environ: strings.Fields(secrets + " WEBAPP_DATABASE__PORT=0")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			k := koanf.New(".")
+			if err := k.Load(rawbytes.Provider([]byte(file)), kyaml.Parser()); err != nil {
+				t.Fatal(err)
+			}
+			if err := k.Load(env.Provider(".", env.Opt{
+				Prefix:        "WEBAPP_",
+				TransformFunc: envKey,
+				EnvironFunc:   func() []string { return tt.environ },
+			}), nil); err != nil {
+				t.Fatal(err)
+			}
+			got, err := config.Load(k)
+			if tt.want == "" {
+				if err == nil {
+					t.Fatalf("accepted: %+v", got)
+				}
+				return
+			}
+			want, wantErr := config.ParseJSON([]byte(tt.want))
+			if err != nil || wantErr != nil || !reflect.DeepEqual(got, want) {
+				t.Fatalf("%v, %v\nLoad      %+v\nParseJSON %+v", err, wantErr, got, want)
+			}
+		})
+	}
+}
+
+// envKey turns WEBAPP_SERVER__HTTP_PORT into server.http_port.
+func envKey(key, value string) (string, any) {
+	return strings.ReplaceAll(strings.ToLower(strings.TrimPrefix(key, "WEBAPP_")), "__", "."), value
 }

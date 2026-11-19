@@ -9,10 +9,12 @@ import (
 	"reflect"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/go-playground/validator/v10"
+	"github.com/knadh/koanf/v2"
 	"go.yaml.in/yaml/v3"
 )
 
@@ -51,6 +53,19 @@ func (x *Config) Validate() error {
 	}
 	x.check("", &errs)
 	return errors.Join(errs...)
+}
+
+// Load decodes a Config from what k holds, as ParseJSON does. Text from
+// environment variables or flags becomes the number or boolean the schema
+// expects there, a list if it expects one (split at commas); keys match
+// fields whatever their case, and a key in another case than the field's
+// (as environment variables give it) wins over the exact one.
+func Load(k *koanf.Koanf) (*Config, error) {
+	data, err := json.Marshal(fromText(k.Raw(), reflect.TypeFor[Config]()))
+	if err != nil {
+		return nil, err
+	}
+	return ParseJSON(data)
 }
 
 type Config struct {
@@ -812,4 +827,139 @@ func decodeMap[T any](data map[string]json.RawMessage, decode func([]byte) (T, e
 		}
 	}
 	return out, nil
+}
+
+// unionVariants are the types a value of each union may have.
+var unionVariants = map[reflect.Type][]reflect.Type{
+	reflect.TypeFor[Cache]():    {reflect.TypeFor[MemoryCache](), reflect.TypeFor[RedisCache]()},
+	reflect.TypeFor[Database](): {reflect.TypeFor[SQLite](), reflect.TypeFor[Postgres](), reflect.TypeFor[MySQL]()},
+}
+
+// fromText converts the text in v to what typ expects, where it is
+// another kind; the rest is left as it is, for ParseJSON to judge.
+func fromText(v any, typ reflect.Type) any {
+	for typ.Kind() == reflect.Pointer {
+		typ = typ.Elem()
+	}
+	switch val := v.(type) {
+	case map[string]any:
+		return mapFromText(val, typ)
+	case []any:
+		if typ.Kind() != reflect.Slice {
+			return v
+		}
+		out := make([]any, len(val))
+		for idx, item := range val {
+			out[idx] = fromText(item, typ.Elem())
+		}
+		return out
+	case string:
+		return scalarFromText(val, typ)
+	}
+	return v
+}
+
+func scalarFromText(text string, typ reflect.Type) any {
+	var out any
+	var err error
+	switch typ.Kind() {
+	case reflect.Bool:
+		out, err = strconv.ParseBool(text)
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		out, err = strconv.ParseInt(text, 10, 64)
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		out, err = strconv.ParseUint(text, 10, 64)
+	case reflect.Float32, reflect.Float64:
+		out, err = strconv.ParseFloat(text, 64)
+	case reflect.Slice:
+		items := []any{}
+		if text != "" {
+			for _, item := range strings.Split(text, ",") {
+				items = append(items, fromText(strings.TrimSpace(item), typ.Elem()))
+			}
+		}
+		return items
+	default:
+		return text
+	}
+	if err != nil {
+		return text
+	}
+	return out
+}
+
+func mapFromText(val map[string]any, typ reflect.Type) any {
+	switch typ.Kind() {
+	case reflect.Map:
+		out := make(map[string]any, len(val))
+		for key, item := range val {
+			out[key] = fromText(item, typ.Elem())
+		}
+		return out
+	case reflect.Interface:
+		if typ = variantFor(val, typ); typ == nil {
+			return val
+		}
+	case reflect.Struct:
+	default:
+		return val
+	}
+	fields, rest := jsonFields(typ)
+	out := make(map[string]any, len(val))
+	for key, item := range val {
+		field, ok := fields[strings.ToLower(key)]
+		switch {
+		case ok && key == field.name && out[field.name] != nil:
+			// the key in another case, from the environment, wins
+		case ok:
+			out[field.name] = fromText(item, field.typ)
+		case rest != nil:
+			out[key] = fromText(item, rest.Elem())
+		default:
+			out[key] = item
+		}
+	}
+	return out
+}
+
+// variantFor is the first variant of union that declares every key of
+// val, or that takes undeclared keys.
+func variantFor(val map[string]any, union reflect.Type) reflect.Type {
+	for _, variant := range unionVariants[union] {
+		if fields, rest := jsonFields(variant); rest != nil || declaresAll(fields, val) {
+			return variant
+		}
+	}
+	return nil
+}
+
+func declaresAll(fields map[string]jsonField, val map[string]any) bool {
+	for key := range val {
+		if _, ok := fields[strings.ToLower(key)]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+type jsonField struct {
+	typ  reflect.Type
+	name string
+}
+
+// jsonFields are the fields of a struct type by their JSON key in lower
+// case, and the type of its map of undeclared keys, if it has one.
+func jsonFields(typ reflect.Type) (map[string]jsonField, reflect.Type) {
+	out := map[string]jsonField{}
+	var rest reflect.Type
+	for idx := range typ.NumField() {
+		field := typ.Field(idx)
+		name, _, _ := strings.Cut(field.Tag.Get("json"), ",")
+		if name == "-" {
+			rest = field.Type
+			continue
+		}
+		out[strings.ToLower(name)] = jsonField{typ: field.Type, name: name}
+	}
+	return out, rest
 }

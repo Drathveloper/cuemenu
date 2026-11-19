@@ -125,6 +125,7 @@ const maxDepth = 32
 type Options struct {
 	Package string // package clause
 	Type    string // root type
+	Koanf   bool   // also Load, from a github.com/knadh/koanf/v2 instance
 }
 
 func (g *generator) warnf(path cue.Path, format string, args ...any) {
@@ -363,6 +364,9 @@ func defKey(val cue.Value) (string, string) {
 func (g *generator) field(val cue.Value, sel cue.Selector, path cue.Path, owner string) *field {
 	label := sel.Unquoted()
 	out := &field{json: label, goName: goName(label), doc: doc(val)}
+	if g.opts.Koanf && strings.Contains(label, ".") {
+		g.warnf(path, "koanf splits keys at \".\": load with another delimiter")
+	}
 	out.ref = g.typeOf(val, path, owner+out.goName)
 	operator, _ := val.Expr()
 	switch {
@@ -514,7 +518,17 @@ func isOpen(val cue.Value) bool {
 	}) {
 		return val.Allows(cue.Str(unknown))
 	}
-	err := val.FillPath(cue.MakePath(cue.Str(unknown)), struct{}{}).Validate()
+	// CUE v0.17.1 panics validating the fill in some schemas (compose-spec:
+	// index out of range in its typo check); Allows is the best left there.
+	err, panicked := error(nil), true
+	func() {
+		defer func() { _ = recover() }()
+		err = val.FillPath(cue.MakePath(cue.Str(unknown)), struct{}{}).Validate()
+		panicked = false
+	}()
+	if panicked {
+		return val.Allows(cue.Str(unknown))
+	}
 	return err == nil || !strings.Contains(err.Error(), "not allowed")
 }
 

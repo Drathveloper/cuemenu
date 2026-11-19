@@ -17,12 +17,12 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"runtime/debug"
 	"slices"
 	"strings"
 
 	tea "charm.land/bubbletea/v2"
 
+	"github.com/Drathveloper/cuemenu/internal/buildinfo"
 	"github.com/Drathveloper/cuemenu/model"
 	"github.com/Drathveloper/cuemenu/tui"
 )
@@ -77,20 +77,14 @@ More: https://github.com/Drathveloper/cuemenu
 // errUsage reports command-line arguments that make no sense.
 var errUsage = errors.New("bad usage")
 
-// Values of the build information when nothing sets them.
-const (
-	devVersion = "dev"
-	unknown    = "unknown"
-)
-
 // Build information, set by `make build` with -ldflags -X. When it is not
-// set, buildInfo falls back on what Go embeds in the binary.
+// set, buildinfo falls back on what Go embeds in the binary.
 //
 //nolint:gochecknoglobals // -X can only set package-level variables
 var (
-	Version   = devVersion
-	Commit    = unknown
-	BuildTime = unknown
+	Version   = buildinfo.Dev
+	Commit    = buildinfo.Unknown
+	BuildTime = buildinfo.Unknown
 )
 
 // Exit codes.
@@ -155,9 +149,7 @@ func about(args []string, stdout io.Writer) bool {
 	}
 	switch args[0] {
 	case "version":
-		info, ok := debug.ReadBuildInfo()
-		build := buildInfo(info, ok)
-		sayf(stdout, "cuemenu %s (commit %s, built %s)\n", build.version, build.commit, build.time)
+		sayf(stdout, "%s\n", buildinfo.Describe("cuemenu", Version, Commit, BuildTime))
 		return true
 	case "help":
 		sayf(stdout, "%s", help)
@@ -272,32 +264,6 @@ func (app cliApp) edit(cfg *model.Config, dir string) int {
 }
 
 func configFile(dir string) string { return filepath.Join(dir, ".config.cue") }
-
-type build struct {
-	version, commit, time string
-}
-
-// buildInfo completes what -ldflags did not set with the data Go embeds:
-// `go install module@version` records the module version, and `go build`
-// in a git checkout records the commit and its time.
-func buildInfo(info *debug.BuildInfo, ok bool) build {
-	out := build{version: Version, commit: Commit, time: BuildTime}
-	if !ok {
-		return out
-	}
-	if out.version == devVersion && info.Main.Version != "" && info.Main.Version != "(devel)" {
-		out.version = info.Main.Version
-	}
-	for _, setting := range info.Settings {
-		if setting.Key == "vcs.revision" && out.commit == unknown {
-			out.commit = setting.Value
-		}
-		if setting.Key == "vcs.time" && out.time == unknown {
-			out.time = setting.Value
-		}
-	}
-	return out
-}
 
 // sayf writes to stdout or stderr: if that fails there is nowhere to report.
 func sayf(out io.Writer, format string, args ...any) {

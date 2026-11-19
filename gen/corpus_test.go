@@ -101,7 +101,7 @@ func agree(t *testing.T, dir, pkgDir string, inputs int) {
 	if schema.Validate() != nil {
 		t.Skip("the schema has errors")
 	}
-	src, warns, err := gen.Generate(schema, gen.Options{Package: "main", Type: rootType})
+	src, warns, err := gen.Generate(schema, gen.Options{Package: "main", Type: rootType, Koanf: true})
 	if err != nil {
 		t.Skip(err)
 	}
