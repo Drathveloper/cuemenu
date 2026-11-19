@@ -248,3 +248,35 @@ func TestVariantChooser(t *testing.T) {
 		t.Fatalf("cache should be redis now: %+v", c)
 	}
 }
+
+// A field of mixed kinds is typed as CUE, but text that is no valid CUE
+// is taken as a string where a string fits (GitHub Actions' runs-on).
+func TestMixedKindPlainString(t *testing.T) {
+	m := load(t, `runs: string | [...string]`+"\n"+`n: int | [...int]`)
+	press(t, m, "enter", "'ubuntu-latest", "enter")
+	if n := m.Selected(); n.Value != `"ubuntu-latest"` || m.Status() != "" {
+		t.Fatalf("plain string: %+v (%s)", n, m.Status())
+	}
+	press(t, m, "enter", "ctrl+u", `'["a", "b"]`, "enter")
+	if n := m.Selected(); !strings.Contains(n.Value, `"b"`) {
+		t.Fatalf("list as CUE: %+v (%s)", n, m.Status())
+	}
+	press(t, m, "down", "enter", "'x-y", "enter")
+	if m.Mode() != modeEditing || m.Status() == "" {
+		t.Errorf("no string fits: the CUE error stays: %s %q", m.Mode(), m.Status())
+	}
+}
+
+// A required field with a single value (JSON Schema's const, as
+// Dependabot's version!: 2) is read-only, but must be given: ⏎ does.
+func TestFixedRequired(t *testing.T) {
+	m := load(t, "version!: 2\nname?: string")
+	press(t, m, "enter")
+	if n := m.Selected(); !n.Set || n.Missing || m.Status() != "" {
+		t.Fatalf("required constant: %+v (%s)", n, m.Status())
+	}
+	press(t, m, "enter")
+	if m.Status() == "" {
+		t.Error("a given constant is just fixed")
+	}
+}

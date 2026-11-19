@@ -15,7 +15,9 @@ import (
 // the caller can ask for its value. It fails if the key exists or no
 // pattern accepts it.
 func (c *Config) Entry(mapPath cue.Path, key string) (*Node, error) {
-	mapVal := c.Value().LookupPath(mapPath)
+	// find, not LookupPath: a required map not filled in yet (m!: [K]: V)
+	// has no value to look up, but its declaration has the patterns.
+	mapVal, _, _ := find(c.Value(), mapPath)
 	if mapVal.LookupPath(cue.MakePath(cue.Str(key))).Exists() {
 		return nil, fmt.Errorf("%w: %q", ErrKeyExists, key)
 	}
@@ -77,7 +79,7 @@ func (c *Config) Choose(path cue.Path, idx int) (*Node, error) {
 	if def, ok := current.Default(); ok {
 		current = def
 	}
-	if chosenVariant(current, alts) == idx {
+	if compatible(current, alts) == 1 && chosenVariant(current, alts) == idx { // already chosen
 		return nil, nil
 	}
 	if ask := askFor(alts, idx, path); ask != nil {
@@ -91,8 +93,8 @@ func (c *Config) Choose(path cue.Path, idx int) (*Node, error) {
 // idx is one of them.
 func (c *Config) variants(path cue.Path, idx int) ([]cue.Value, error) {
 	decl, _, found := find(c.without(path), path)
-	op, alts := expr(decl)
-	if !found || op != cue.OrOp || idx < 0 || idx >= len(alts) {
+	alts := variantAlts(decl)
+	if !found || idx < 0 || idx >= len(alts) {
 		return nil, fmt.Errorf("%s: %w", path, ErrNotVariant)
 	}
 	return alts, nil
@@ -308,8 +310,15 @@ func askFor(alts []cue.Value, idx int, path cue.Path) *Node {
 	if len(own) == 0 {
 		return nil
 	}
-	fld := alts[idx].LookupPath(cue.MakePath(cue.Str(own[0])))
-	return firstLeaf(fld, child(path, cue.Str(own[0])), own[0])
+	if required := requiredOf(alts[idx], own); len(required) > 0 {
+		own = required // the field the variant is named after
+	}
+	fld, sel, _ := field(alts[idx], cue.Str(own[0])) // not LookupPath: it misses x!
+	node := firstLeaf(fld, child(path, sel), own[0])
+	if node != nil && node.Path.String() == child(path, sel).String() {
+		node.Required = sel.ConstraintType() == cue.RequiredConstraint
+	}
+	return node
 }
 
 // ownFields lists the fields of alternative idx that no other has.
@@ -335,7 +344,7 @@ func ownFields(alts []cue.Value, idx int) []string {
 func compatible(val cue.Value, alts []cue.Value) int {
 	count := 0
 	for _, alt := range alts {
-		if val.Unify(alt).Err() == nil {
+		if fits(val, alt) {
 			count++
 		}
 	}
@@ -345,7 +354,7 @@ func compatible(val cue.Value, alts []cue.Value) int {
 // chosenVariant is the first alternative val is still compatible with.
 func chosenVariant(val cue.Value, alts []cue.Value) int {
 	for idx, alt := range alts {
-		if val.Unify(alt).Err() == nil {
+		if fits(val, alt) {
 			return idx
 		}
 	}

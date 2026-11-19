@@ -6,6 +6,7 @@ package model
 import (
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 
 	"cuelang.org/go/cue"
@@ -48,6 +49,7 @@ type Node struct {
 	Secret   bool     // @menu(secret)
 	Optional bool     // label?
 	Required bool     // label!
+	Missing  bool     // required and not given yet
 	Chooser  bool     // Choice that picks a variant: use Config.Choose
 	Open     bool     // Menu declared with ...: Config.Entry adds fields
 }
@@ -100,6 +102,8 @@ func classifyDisjunction(node *Node, alts []cue.Value) bool {
 		}
 	case all(alts, isNullOrList):
 		node.Widget = List
+	case untypedStruct(alts):
+		node.Widget = Menu
 	default:
 		return false
 	}
@@ -143,6 +147,35 @@ func isNullOrList(val cue.Value) bool {
 	return kind == cue.NullKind || kind == cue.ListKind
 }
 
+// untypedStruct: any JSON value, but a struct with these fields if it is
+// one. cue import makes it of a JSON Schema with properties but no
+// "type": null | bool | number | string | [...] | {…} (docker-compose's
+// services). It is edited as the struct, like null | T as T.
+func untypedStruct(alts []cue.Value) bool {
+	structs, kinds := 0, 0
+	for _, alt := range alts {
+		switch {
+		case isStruct(alt):
+			structs++
+		case anyOfKind(alt):
+			kinds++
+		case alt.IncompleteKind() != cue.NullKind:
+			return false
+		}
+	}
+	return structs == 1 && kinds >= minUntyped
+}
+
+// minUntyped: as many of bool, number, string and [...] next to a struct
+// make it untyped; fewer are a real choice (codecov's status: bool | {…}).
+const minUntyped = 3
+
+// anyOfKind: any value of a kind, unconstrained: bool, number, string,
+// [...].
+func anyOfKind(val cue.Value) bool {
+	return slices.Contains([]string{"bool", "number", "int", "float", "string", "[...]", "[..._]"}, format(val))
+}
+
 func isStruct(val cue.Value) bool { return val.IncompleteKind() == cue.StructKind }
 
 func isConstScalar(val cue.Value) bool {
@@ -152,18 +185,121 @@ func isConstScalar(val cue.Value) bool {
 // expr is val.Expr(), seeing through a reference into another package
 // (pkg.Name), which Expr reports as a selector instead of what it names.
 func expr(val cue.Value) (cue.Op, []cue.Value) {
+	operator, args := rawExpr(val)
+	if operator == cue.AndOp {
+		if alts, ok := embeddedOr(args); ok {
+			return cue.OrOp, alts
+		}
+	}
+	if operator == cue.CallOp {
+		if alts, ok := matchAny(args); ok {
+			return cue.OrOp, alts
+		}
+	}
+	return operator, args
+}
+
+// matchAll returns the parts of matchN(N, [A, B]) with N of them all:
+// JSON Schema's allOf (docker-compose's service is a container spec and
+// a workload spec).
+func matchAll(val cue.Value) ([]cue.Value, bool) {
+	const matchArgs = 3
+	operator, args := rawExpr(val)
+	if operator != cue.CallOp || len(args) != matchArgs || format(args[0]) != "matchN" {
+		return nil, false
+	}
+	var parts []cue.Value
+	iter, err := args[2].List()
+	for err == nil && iter.Next() {
+		parts = append(parts, iter.Value())
+	}
+	return parts, format(args[1]) == strconv.Itoa(len(parts))
+}
+
+// allOfStruct is the struct that the allOf parts of decl require:
+// matchN(N, [A, B]) only checks them, so their fields are not in the
+// value (docker-compose's service: its container and workload specs).
+func allOfStruct(decl cue.Value) (cue.Value, bool) {
+	var out cue.Value
+	for _, part := range allOfParts(decl) {
+		if part = nonNull(part); isStruct(part) {
+			out = unifyAll(out, part)
+		}
+	}
+	return out, out.Exists()
+}
+
+func allOfParts(decl cue.Value) []cue.Value {
+	operator, args := rawExpr(decl)
+	if operator == cue.AndOp {
+		out := make([]cue.Value, 0, len(args))
+		for _, arg := range args {
+			out = append(out, allOfParts(arg)...)
+		}
+		return out
+	}
+	if parts, ok := matchAll(decl); ok {
+		return parts
+	}
+	return nil
+}
+
+func unifyAll(acc, val cue.Value) cue.Value {
+	if !acc.Exists() {
+		return val
+	}
+	return acc.Unify(val)
+}
+
+// rawExpr is val.Expr(), through a reference to another package.
+func rawExpr(val cue.Value) (cue.Op, []cue.Value) {
 	operator, args := val.Expr()
 	if operator == cue.SelectorOp {
 		if root, path := val.ReferencePath(); len(path.Selectors()) > 0 {
 			return root.LookupPath(path).Expr()
 		}
 	}
-	if operator == cue.AndOp {
-		if alts, ok := embeddedOr(args); ok {
-			return cue.OrOp, alts
-		}
-	}
 	return operator, args
+}
+
+// validatesOnly: decl is a matchN, which checks a value against its
+// alternatives without unifying it with them.
+func validatesOnly(decl cue.Value) bool {
+	operator, args := rawExpr(decl)
+	if operator == cue.AndOp { // embedded: {@jsonschema(…), matchN(…)}
+		return slices.ContainsFunc(args, validatesOnly)
+	}
+	_, ok := matchAny(args)
+	return operator == cue.CallOp && ok
+}
+
+// matchAny returns the alternatives of matchN(1, [A, B]) or matchN(>=1,
+// [A, B]), JSON Schema's oneOf and anyOf as imported by cue: a value that
+// matches one of them, edited like A | B. args are those of the call:
+// the function, n and the list.
+func matchAny(args []cue.Value) ([]cue.Value, bool) {
+	const matchArgs = 3
+	if len(args) != matchArgs || format(args[0]) != "matchN" {
+		return nil, false
+	}
+	count := format(args[1])
+	if count != "1" && count != ">=1" {
+		return nil, false
+	}
+	var alts []cue.Value
+	iter, err := args[2].List()
+	for err == nil && iter.Next() {
+		alts = append(alts, iter.Value())
+	}
+	return alts, len(alts) > 0
+}
+
+// neutral: a part of a conjunction that adds no fields or kind to a
+// disjunction next to it: a definition with no fields, or a validator
+// that declares none (matchN(2, …), not close({…}), which has the fields
+// of GitHub Actions' steps).
+func neutral(arg cue.Value, operator cue.Op) bool {
+	return (isStruct(arg) || operator == cue.CallOp) && !declaresFields(arg)
 }
 
 // embeddedOr finds the one disjunction of a conjunction whose other parts
@@ -181,7 +317,7 @@ func embeddedOr(args []cue.Value) ([]cue.Value, bool) {
 			alts = sub
 		case operator == cue.OrOp:
 			return nil, false
-		case isStruct(arg) && !declaresFields(arg):
+		case neutral(arg, operator):
 		case isScalarType(arg):
 			types = append(types, arg)
 		default:
@@ -220,9 +356,15 @@ func declaresFields(val cue.Value) bool {
 // as list.MinItems(1), then it is the intersection of the kinds of the
 // conjuncts; and a struct whose if tests a required field not yet set,
 // which still has fields.
-func kindOf(val cue.Value, op cue.Op, args []cue.Value) cue.Kind {
+func kindOf(val cue.Value, operator cue.Op, args []cue.Value) cue.Kind {
 	kind := val.IncompleteKind()
-	if kind == cue.BottomKind && op == cue.AndOp {
+	if kind == cue.TopKind && operator == cue.OrOp { // matchN: any value, but checked against these
+		kind = cue.BottomKind
+		for _, arg := range flattenOr(args) {
+			kind |= arg.IncompleteKind()
+		}
+	}
+	if kind == cue.BottomKind && operator == cue.AndOp {
 		kind = cue.TopKind
 		for _, arg := range args {
 			kind &= arg.IncompleteKind()
@@ -329,16 +471,44 @@ func leafValue(val cue.Value) string {
 	if !val.IsConcrete() {
 		return ""
 	}
-	text, err := cueformat.Node(val.Syntax(cue.Final(), cue.Attributes(false)))
-	if err != nil {
+	var text []byte
+	var err error
+	if !safe(func() { text, err = cueformat.Node(val.Syntax(cue.Final(), cue.Attributes(false))) }) || err != nil {
+		if data, jerr := val.MarshalJSON(); jerr == nil { // JSON is CUE too
+			return string(data)
+		}
 		return format(val)
 	}
 	return string(text)
 }
 
+// safe runs export and reports whether it finished: CUE's exporter panics
+// on some values of GitHub Actions' schema (quoted definitions, #."x").
+func safe(export func()) bool {
+	done := false
+	func() {
+		defer func() { _ = recover() }()
+		export()
+		done = true
+	}()
+	return done
+}
+
 // variantNames labels each struct variant by a field holding a distinct
 // concrete string in every variant (a discriminator such as "type").
 // Without one, each variant is named by the fields only it has.
+// requiredOf keeps the names of fields that val requires (x!).
+func requiredOf(val cue.Value, names []string) []string {
+	var out []string
+	iter, err := val.Fields(cue.Optional(true))
+	for err == nil && iter.Next() {
+		if sel := iter.Selector(); sel.ConstraintType() == cue.RequiredConstraint && slices.Contains(names, sel.Unquoted()) {
+			out = append(out, sel.Unquoted())
+		}
+	}
+	return out
+}
+
 func variantNames(alts []cue.Value) ([]string, cue.Path) {
 	iter, err := alts[0].Fields()
 	for err == nil && iter.Next() {
@@ -349,7 +519,11 @@ func variantNames(alts []cue.Value) ([]string, cue.Path) {
 	}
 	names := make([]string, len(alts))
 	for idx := range alts {
-		names[idx] = strings.Join(ownFields(alts, idx), ", ")
+		own := ownFields(alts, idx)
+		if required := requiredOf(alts[idx], own); len(required) > 0 {
+			own = required // GitHub Actions' jobs: "runs-on" or "uses"
+		}
+		names[idx] = strings.Join(own, ", ")
 		if names[idx] == "" {
 			names[idx] = fmt.Sprintf("variant %d", idx+1)
 		}
@@ -404,7 +578,12 @@ func under(path, root cue.Path) bool {
 // touches reports whether one path contains the other.
 func touches(a, b cue.Path) bool { return under(a, b) || under(b, a) }
 
-func format(val cue.Value) string { return fmt.Sprint(val) }
+// format prints val, or nothing where CUE's exporter panics (see safe).
+func format(val cue.Value) string {
+	var text string
+	safe(func() { text = fmt.Sprint(val) })
+	return text
+}
 
 func all(vals []cue.Value, pred func(cue.Value) bool) bool {
 	for _, val := range vals {

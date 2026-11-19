@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -211,10 +212,20 @@ func (m *Model) open(node *model.Node) {
 	case model.Toggle:
 		m.toggle(node)
 	case model.ReadOnly:
-		m.status = msgFixed
+		m.fixed(node)
 	case model.Choice, model.Number, model.Text, model.Expr:
 		m.editOrChoose(node, nil)
 	}
+}
+
+// fixed: a read-only field can only be given its value, if required
+// and not given yet (version!: 2, JSON Schema's const).
+func (m *Model) fixed(node *model.Node) {
+	if node.Missing && node.Value != "" {
+		m.apply(m.cfg.SetExpr(node.Path, node.Value))
+		return
+	}
+	m.status = msgFixed
 }
 
 // editOrChoose opens the chooser or the editor for node. set receives the
@@ -256,12 +267,23 @@ func (m *Model) valueCommit(node *model.Node, set func(string) error) func(strin
 		case set == nil && !asExpr:
 			return m.cfg.Set(node.Path, text)
 		case set == nil:
-			return m.cfg.SetExpr(node.Path, text)
+			return orString(node, text, func(expr string) error { return m.cfg.SetExpr(node.Path, expr) })
 		case !asExpr:
 			return set(literal.String.Quote(text))
 		}
-		return set(text)
+		return orString(node, text, set)
 	}
+}
+
+// orString applies text as CUE; for a field of mixed kinds (a string or
+// a list, as JSON Schema's oneOf often is), text that is no valid CUE is
+// tried as a string: ubuntu-latest needs no quotes.
+func orString(node *model.Node, text string, set func(string) error) error {
+	err := set(text)
+	if errors.Is(err, model.ErrInvalidExpr) && node.Widget == model.Expr && set(literal.String.Quote(text)) == nil {
+		return nil
+	}
+	return err
 }
 
 // chooseVariant picks a variant; if it is told apart by a field, the

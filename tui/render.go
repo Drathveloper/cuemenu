@@ -220,7 +220,7 @@ func markers(node *model.Node) string {
 	if node.Set {
 		out += " *"
 	}
-	if node.Required && node.Value == "" {
+	if node.Missing {
 		out += " ⚠ required"
 	}
 	if len(node.Errors) > 0 {

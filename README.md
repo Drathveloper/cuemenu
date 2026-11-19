@@ -44,6 +44,7 @@ cuemenu help                                  # full help: commands, flags, edit
 | `[...T]` | editable list; a struct element is a submenu of its own |
 | `[string]: T`, `[=~"^X-"]: T` | map: keys are checked against the pattern |
 | `#A \| #B` | variant: choosing one changes the fields |
+| `matchN(1, [A, B])`, `matchN(>=1, …)`, `matchN(N, …)` (JSON Schema's oneOf, anyOf, allOf as `cue import` writes them) | like `A \| B`; allOf parts add their fields |
 | computed or fixed field | read-only |
 | `if`, `for` | fields appear and disappear as values change |
 | a package that is `[string]: T` or `#A \| #B` at its top level | the top menu is that map or variant |

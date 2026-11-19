@@ -20,20 +20,21 @@ func find(val cue.Value, path cue.Path) (cue.Value, cue.Selector, bool) {
 }
 
 func findIn(val cue.Value, sels []cue.Selector, expand bool) (cue.Value, cue.Selector, bool) {
-	if fld, sel, found := field(val, sels[0]); found {
-		if len(sels) == 1 {
+	// Declared fields first, in val or in an alternative; only then any
+	// field of a struct declared with ...: one that an alternative (an
+	// allOf part) declares has a better type than _.
+	for _, lookup := range []lookupFunc{declared, field} {
+		if fld, sel, found := descend(val, sels, lookup); found {
 			return fld, sel, true
 		}
-		if sub, subSel, subFound := findIn(fld, sels[1:], true); subFound {
-			return sub, subSel, true
+		if !expand {
+			continue
 		}
-	}
-	if !expand {
-		return cue.Value{}, cue.Selector{}, false
-	}
-	for _, alt := range alternatives(val) {
-		if unified := val.Unify(alt); unified.Err() == nil {
-			if fld, sel, found := findIn(unified, sels, false); found {
+		for _, alt := range alternatives(val) {
+			if !fits(val, alt) {
+				continue
+			}
+			if fld, sel, found := descend(val.Unify(alt), sels, lookup); found {
 				return fld, sel, true
 			}
 		}
@@ -41,10 +42,21 @@ func findIn(val cue.Value, sels []cue.Selector, expand bool) (cue.Value, cue.Sel
 	return cue.Value{}, cue.Selector{}, false
 }
 
+type lookupFunc func(cue.Value, cue.Selector) (cue.Value, cue.Selector, bool)
+
+// descend looks up sels[0] in val with lookup, then the rest below it.
+func descend(val cue.Value, sels []cue.Selector, lookup lookupFunc) (cue.Value, cue.Selector, bool) {
+	fld, sel, found := lookup(val, sels[0])
+	if !found || len(sels) == 1 {
+		return fld, sel, found
+	}
+	return findIn(fld, sels[1:], true)
+}
+
 // field looks up a direct field of val by name, including x? and x!.
 // The field iterator yields nothing on a disjunction, so its default is
 // searched too.
-func field(val cue.Value, sel cue.Selector) (cue.Value, cue.Selector, bool) {
+func declared(val cue.Value, sel cue.Selector) (cue.Value, cue.Selector, bool) {
 	if sel.Type() == cue.IndexLabel { // an element of a list
 		elem := elemAt(val, sel.Index())
 		return elem, sel, elem.Exists()
@@ -69,7 +81,15 @@ func field(val cue.Value, sel cue.Selector) (cue.Value, cue.Selector, bool) {
 	if constraint, ok := patternFor(val, name); ok {
 		return constraint, sel, true
 	}
-	if anything, ok := declaredOpen(val); ok {
+	return cue.Value{}, cue.Selector{}, false
+}
+
+// field is declared, or any field of a struct declared with ....
+func field(val cue.Value, sel cue.Selector) (cue.Value, cue.Selector, bool) {
+	if fld, decl, found := declared(val, sel); found {
+		return fld, decl, true
+	}
+	if anything, ok := declaredOpen(val); ok && sel.IsString() {
 		return anything, sel, true
 	}
 	return cue.Value{}, cue.Selector{}, false
@@ -81,7 +101,7 @@ func field(val cue.Value, sel cue.Selector) (cue.Value, cue.Selector, bool) {
 // but treating them so would keep fields of an `if` that no longer holds,
 // so they only take declared fields.
 func declaredOpen(val cue.Value) (cue.Value, bool) {
-	if val.IncompleteKind() == cue.TopKind {
+	if operator, _ := rawExpr(val); val.IncompleteKind() == cue.TopKind && operator != cue.CallOp { // matchN(…) is no _
 		return val, true
 	}
 	if rest := val.LookupPath(cue.MakePath(cue.AnyString)); rest.Exists() {
@@ -92,21 +112,27 @@ func declaredOpen(val cue.Value) (cue.Value, bool) {
 
 // alternatives lists the disjuncts in val's expression, default first.
 func alternatives(val cue.Value) []cue.Value {
-	operator, args := expr(val)
-	if operator == cue.OrOp {
+	if operator, args := rawExpr(val); operator == cue.AndOp {
+		out := make([]cue.Value, 0, len(args))
+		for _, arg := range args {
+			out = append(out, alternatives(arg)...)
+		}
+		return out
+	}
+	if operator, args := expr(val); operator == cue.OrOp {
 		if def, ok := val.Default(); ok {
 			return append([]cue.Value{def}, args...)
 		}
 		return args
 	}
-	if operator != cue.AndOp {
+	parts, ok := matchAll(val)
+	if !ok {
 		return nil
 	}
-	var out []cue.Value
-	for _, arg := range args {
-		out = append(out, alternatives(arg)...)
+	for idx, part := range parts {
+		parts[idx] = nonNull(part) // the struct of an untyped part: any JSON, or {…}
 	}
-	return out
+	return parts
 }
 
 // patterns describes the pattern constraints of val as "[K]: T".
@@ -134,4 +160,14 @@ func patternFor(val cue.Value, key string) (cue.Value, bool) {
 		}
 	}
 	return cue.Value{}, false
+}
+
+// fits reports whether val can still become alt: no permanent conflict.
+// Not Err(), which also fails on values not complete yet: a struct that
+// misses a required field fails matchN (JSON Schema's oneOf) until then.
+// CUE can panic unifying with a value from Expr() (docker-compose's
+// allOf parts): then it does not fit.
+func fits(val, alt cue.Value) bool {
+	var err error
+	return safe(func() { err = val.Unify(alt).Validate() }) && err == nil
 }

@@ -823,3 +823,197 @@ ports: [...int]`)
 		t.Errorf("after fixing it: %+v", n)
 	}
 }
+
+// A required map not filled in yet (GitHub Actions' jobs!) takes keys:
+// its patterns are in the declaration, not in a value.
+func TestRequiredMapEntry(t *testing.T) {
+	c := compile(t, "import \"struct\"\njobs!: struct.MinFields(1) & close({[=~\"^[a-z]+$\"]: {runs: string}})\nname!: string")
+	if nodes := tree(c); !nodes["jobs"].Missing || !nodes["name"].Missing {
+		t.Errorf("required and not given: %+v %+v", nodes["jobs"], nodes["name"])
+	}
+	entry, err := c.Entry(cue.ParsePath("jobs"), "build")
+	if err != nil || entry.Widget != model.Menu {
+		t.Fatalf("entry of a required map: %+v, %v", entry, err)
+	}
+	if _, err := c.Entry(cue.ParsePath("jobs"), "Bad"); err == nil {
+		t.Error("a key outside the pattern was accepted")
+	}
+	set(t, c, "jobs.build.runs", "x")
+	set(t, c, "name", "n")
+	nodes := tree(c)
+	if n := nodes["jobs.build.runs"]; n == nil || n.Value != cueX {
+		t.Errorf("field of the new entry: %+v", n)
+	}
+	if nodes["jobs"].Missing || nodes["name"].Missing {
+		t.Errorf("given, no longer missing: %+v %+v", nodes["jobs"], nodes["name"])
+	}
+}
+
+// JSON Schema's oneOf/anyOf, imported by cue as matchN(1, […]) and
+// matchN(>=1, […]), as in GitHub Actions: edited like a disjunction.
+func TestMatchN(t *testing.T) {
+	c := compile(t, `
+#step: matchN(1, [{uses!: _, ...}, {run!: _, ...}]) & close({
+	name?: string
+	uses?: string
+	run?:  string
+})
+#normalJob: close({snapshot?: string, "runs-on"!: string, steps?: [...#step]})
+#callJob: close({uses!: string, with?: [string]: string})
+jobs!: [=~"^[a-z]+$"]: matchN(1, [#normalJob, #callJob])
+shell?: matchN(>=1, [string, "bash" | "sh"])
+names?: matchN(1, [string, [...string]])
+not?: matchN(0, [string])`)
+	nodes := tree(c)
+	if n := nodes["shell"]; n == nil || n.Widget != model.Text {
+		t.Errorf("anyOf of strings: %+v", n)
+	}
+	if n := nodes["names"]; n == nil || n.Widget != model.Expr {
+		t.Errorf("string or list: %+v", n)
+	}
+	entry, err := c.Entry(cue.ParsePath("jobs"), "build")
+	if err != nil || entry.Widget != model.Variant || strings.Join(entry.Options, ",") != "runs-on,uses" {
+		t.Fatalf("oneOf of structs: %+v, %v", entry, err)
+	}
+	set(t, c, "jobs.build", map[string]any{})
+	ask, err := c.Choose(cue.ParsePath("jobs.build"), 0)
+	if err != nil || ask == nil || ask.Path.String() != `jobs.build."runs-on"` || ask.Widget != model.Text || !ask.Required {
+		t.Fatalf("choosing a oneOf variant asks for its field: %+v, %v", ask, err)
+	}
+	set(t, c, `jobs.build."runs-on"`, "ubuntu")
+	if n := tree(c)[`jobs.build."runs-on"`]; n == nil || n.Widget != model.Text {
+		t.Fatalf("a field set in a oneOf variant keeps its own widget: %+v", n)
+	}
+	if err := c.SetList(cue.ParsePath("jobs.build.steps"), []string{"{}"}); err != nil {
+		t.Fatal(err)
+	}
+	nodes = tree(c)
+	if n := nodes[`jobs.build."runs-on"`]; n == nil || !n.Set {
+		t.Fatalf("a field of the chosen oneOf variant was dropped when setting another: %+v", n)
+	}
+	if n := nodes["jobs.build.steps[0]"]; n == nil || n.Widget != model.Menu {
+		t.Fatalf("a step, matchN(1, [{uses!: _, ...}, …]) & close({…}), is a menu of its fields: %+v", n)
+	}
+	if n := nodes["jobs.build.steps[0].run"]; n == nil || n.Widget != model.Text {
+		t.Fatalf("fields of an element inside a oneOf variant: %+v", n)
+	}
+	set(t, c, "jobs.build.steps[0].run", "make")
+	if got := exportJSON(t, c); got != `{"jobs":{"build":{"runs-on":"ubuntu","steps":[{"run":"make"}]}}}` {
+		t.Errorf("export: %s", got)
+	}
+}
+
+// Choosing the first variant while none is decided yet ({} fits both)
+// must ask for its field, not take it as already chosen.
+func TestChooseFirstUndecided(t *testing.T) {
+	c := compile(t, "#A: close({a!: int})\n#B: close({b!: string})\nx: #A | #B\nx: {}")
+	ask, err := c.Choose(cue.ParsePath("x"), 0)
+	if err != nil || ask == nil || ask.Path.String() != "x.a" {
+		t.Fatalf("choose the first variant: %+v, %v", ask, err)
+	}
+}
+
+// The fields of a variant chosen by default keep their widget: an enum
+// with a default stays a choice (KubeVela's startup-probe).
+func TestVariantFieldsKeepWidgets(t *testing.T) {
+	c := compile(t, "#x: {httpGet?: {scheme?: *\"HTTP\" | \"HTTPS\"}}\n*#x | close({probes: [...#x]})")
+	if n := tree(c)["httpGet.scheme"]; n == nil || n.Widget != model.Choice {
+		t.Errorf("enum inside the default variant: %+v", n)
+	}
+}
+
+// A package that is a struct or a scalar (Azure Pipelines: matchN(1,
+// [#pipeline, =~"^$"])) is a menu of the struct's fields.
+func TestRootStructOrScalar(t *testing.T) {
+	c := compile(t, "#pipeline: close({trigger?: string, pool?: {vmImage?: string}})\nmatchN(1, [#pipeline, =~\"^$\"])")
+	root := c.Root()
+	if root.Widget != model.Menu || len(root.Children) != 2 {
+		t.Fatalf("root: %+v", root)
+	}
+	set(t, c, "pool.vmImage", "ubuntu-latest")
+	if got := exportJSON(t, c); got != `{"pool":{"vmImage":"ubuntu-latest"}}` {
+		t.Errorf("export: %s", got)
+	}
+}
+
+// matchIf (JSON Schema's if/then/else) next to a closed struct, as in
+// Dependabot's schema: valid edits must not be rejected.
+func TestMatchIfClosed(t *testing.T) {
+	c := compile(t, "matchIf({beta!: true, ...}, {...}, {...}) & close({version?: int, beta?: bool, updates!: [...{eco?: string}]})")
+	set(t, c, "version", 2)
+	if err := c.SetList(cue.ParsePath("updates"), []string{"{}"}); err != nil {
+		t.Fatalf("valid edit rejected: %v", err)
+	}
+	set(t, c, "updates[0].eco", "gomod")
+	if got := exportJSON(t, c); !strings.Contains(got, `"version":2`) || !strings.Contains(got, `"updates":[{"eco":"gomod"}]`) {
+		t.Errorf("export: %s", got)
+	}
+}
+
+// A JSON Schema with properties but no type, as cue import writes it
+// (docker-compose's services): any JSON, a struct if it is one. Edited
+// as the struct, with the fields of its allOf parts (matchN(2, […])).
+func TestUntypedStruct(t *testing.T) {
+	c := compile(t, `#untyped: null | bool | number | string | [...]
+#container: #untyped | {image?: string, ports?: [...string], ...}
+#workload: #untyped | {scale?: int, ...}
+#service: matchN(2, [#container, #workload]) & (#untyped | {restart?: string, ...})
+services?: [=~"^[a-z]+$"]: #service`)
+	entry, err := c.Entry(cue.ParsePath("services"), "web")
+	if err != nil || entry.Widget != model.Menu {
+		t.Fatalf("untyped struct entry: %+v, %v", entry, err)
+	}
+	set(t, c, "services.web", map[string]any{})
+	for range 2 { // before and after an edit
+		nodes := tree(c)
+		for path, widget := range map[string]model.Widget{
+			"services.web.image": model.Text, "services.web.ports": model.List,
+			"services.web.scale": model.Number, "services.web.restart": model.Text,
+		} {
+			if n := nodes[path]; n == nil || n.Widget != widget {
+				t.Fatalf("%s, with the allOf parts: %+v", path, n)
+			}
+		}
+		set(t, c, "services.web.image", "nginx")
+	}
+	if got := exportJSON(t, c); got != `{"services":{"web":{"image":"nginx"}}}` {
+		t.Errorf("export: %s", got)
+	}
+}
+
+// bool | {…} is a real choice, not an untyped struct (codecov's status).
+func TestBoolOrStruct(t *testing.T) {
+	c := compile(t, `status?: matchN(>=1, [bool, close({project?: string})])`)
+	if n := tree(c)["status"]; n == nil || n.Widget != model.Expr {
+		t.Errorf("bool or struct: %+v", n)
+	}
+}
+
+// Fields keep the schema's order once set, in the menu and in the export,
+// also when they are all optional (JSON Schema): a struct otherwise lists
+// the fields it was given first.
+func TestFieldOrder(t *testing.T) {
+	c := compile(t, "s?: {z?: int, m?: int, a?: int}\nname?: string\nport?: int\nkeys?: [string]: int")
+	set(t, c, "keys.b", 1)
+	set(t, c, "port", 1)
+	set(t, c, "s.a", 1)
+	set(t, c, "s.z", 2)
+	set(t, c, "name", "x")
+	set(t, c, "keys.a", 2)
+	labels := func(nodes []*model.Node) string {
+		out := make([]string, 0, len(nodes))
+		for _, n := range nodes {
+			out = append(out, n.Label)
+		}
+		return strings.Join(out, " ")
+	}
+	if got := labels(c.Tree()); got != "s name port keys" {
+		t.Errorf("root menu: %s", got)
+	}
+	if got := labels(tree(c)["s"].Children); got != "z m a" {
+		t.Errorf("struct menu: %s", got)
+	}
+	if got := exportJSON(t, c); got != `{"s":{"z":2,"a":1},"name":"x","port":1,"keys":{"a":2,"b":1}}` {
+		t.Errorf("export: %s", got)
+	}
+}

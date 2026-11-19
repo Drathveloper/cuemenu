@@ -184,7 +184,7 @@ func (r row) checkWant(t *testing.T, cfg *model.Config) {
 		return
 	}
 	path := cmp.Or(r.wantPath, r.path)
-	got, err := json.Marshal(cfg.Value().LookupPath(cue.ParsePath(path)))
+	got, err := json.Marshal(cfg.ExportValue().LookupPath(cue.ParsePath(path)))
 	if err != nil {
 		t.Fatalf("%s: %v", path, err)
 	}

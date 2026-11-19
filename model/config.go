@@ -31,6 +31,7 @@ var (
 	ErrKeyExists   = errors.New("key already exists")
 	ErrKeyPattern  = errors.New("key matches no pattern")
 	ErrNotVariant  = errors.New("not a variant")
+	ErrInternal    = errors.New("CUE failed evaluating this value; the change was undone")
 )
 
 const (
@@ -44,22 +45,38 @@ const (
 // from the schema, so schema defaults keep flowing in.
 type Config struct {
 	ctx    *cue.Context
-	edits  map[string]edit // keyed by path string
+	edits  map[string]edit           // keyed by path string
+	memo   map[string]cue.Value      // while building the tree: without, by the edits left out
+	fields map[string][]cue.Selector // the fields declared in each struct of the schema
+	root   *Node                     // the last tree built, for the edits in rootOf
 	schema cue.Value
+	rootOf string
 }
 
 type edit struct {
 	val  cue.Value
+	text string // val as CUE, "" if it cannot be printed
 	path cue.Path
 }
 
 // New returns a configuration of schema with no edits.
 func New(schema cue.Value) *Config {
-	return &Config{ctx: cuecontext.New(), edits: map[string]edit{}, schema: schema}
+	return &Config{ctx: cuecontext.New(), edits: map[string]edit{}, schema: schema, fields: map[string][]cue.Selector{}}
 }
 
 // Value is the schema unified with every edit.
-func (c *Config) Value() cue.Value { return c.apply(func(cue.Path) bool { return true }) }
+func (c *Config) Value() cue.Value {
+	if full, ok := c.memo[memoAll]; ok {
+		return full
+	}
+	full := c.apply(func(cue.Path) bool { return true })
+	if c.memo != nil {
+		c.memo[memoAll] = full
+	}
+	return full
+}
+
+const memoAll = "\x01all" // the key of Value in Config.memo
 
 // Set changes the field at path. x is a Go value (string, bool, int,
 // float, slices, maps) or a cue.Value compiled from an expression. The
@@ -98,6 +115,10 @@ func (c *Config) Set(path cue.Path, x any) error {
 		c.edits = saved
 		return fmt.Errorf("%w:\n%s", ErrRejected, strings.Join(causes, "\n"))
 	}
+	if !safe(func() { c.Root() }) { // a CUE panic must not take the editor and its unsaved changes down
+		c.edits = saved
+		return fmt.Errorf("%s: %w", path, ErrInternal)
+	}
 	return nil
 }
 
@@ -130,25 +151,44 @@ func (c *Config) Tree() []*Node { return c.Root().Children }
 // a Menu, unless the package is something else at its top level: a map
 // ([string]: T) or a variant (#A | #B), as KubeVela's parameters can be.
 func (c *Config) Root() *Node {
-	full := c.Value()
-	errs := map[string][]string{}
-	for _, cerr := range cueerrors.Errors(full.Validate()) {
-		labels := cerr.Path()
-		sels := make([]cue.Selector, 0, len(labels))
-		for _, label := range labels {
-			if idx, err := strconv.Atoi(label); err == nil { // a list element
-				sels = append(sels, cue.Index(idx))
-			} else {
-				sels = append(sels, cue.Str(label))
-			}
-		}
-		key := cue.MakePath(sels...).String()
-		errs[key] = append(errs[key], cerr.Error())
+	edits, printable := c.fingerprint()
+	if printable && c.root != nil && edits == c.rootOf { // Set built it to check it can be
+		return c.root
 	}
-	root := &Node{Label: "(root)", Errors: errs[""]}
-	classify(root, c.schema)
-	c.fill(root, full, c.schema, errs)
+	c.memo = map[string]cue.Value{} // the edits do not change while building
+	defer func() { c.memo = nil }()
+	root := c.buildRoot()
+	if printable {
+		c.root, c.rootOf = root, edits
+	}
 	return root
+}
+
+// structsOrScalars returns the struct alternatives of a disjunction whose
+// other alternatives are scalars.
+func structsOrScalars(val cue.Value) ([]cue.Value, bool) {
+	op, args := expr(val)
+	if op != cue.OrOp {
+		return nil, false
+	}
+	for _, alt := range flattenOr(args) {
+		if !isStruct(alt) && alt.IncompleteKind()&(cue.StructKind|cue.ListKind) != 0 {
+			return nil, false
+		}
+	}
+	alts := variantAlts(val)
+	return alts, len(alts) > 0
+}
+
+// variantAlts are the alternatives of the variant declared as decl, as
+// its options list them: flattened, and only structs (a root variant can
+// also be an empty document).
+func variantAlts(decl cue.Value) []cue.Value {
+	op, args := expr(decl)
+	if op != cue.OrOp {
+		return nil
+	}
+	return slices.DeleteFunc(flattenOr(args), func(alt cue.Value) bool { return !isStruct(alt) })
 }
 
 // Load reads edits saved by Save. A missing file means no edits. Edits
@@ -218,7 +258,7 @@ func (c *Config) Export(encoding string) ([]byte, error) {
 	if err := c.Check(); err != nil {
 		return nil, err
 	}
-	val := c.Value()
+	val := c.exportValue()
 	switch encoding {
 	case "json":
 		data, err := json.MarshalIndent(val, "", "  ")
@@ -236,7 +276,84 @@ func (c *Config) Export(encoding string) ([]byte, error) {
 	return nil, fmt.Errorf("%w: %q", ErrFormat, encoding)
 }
 
+// fingerprint identifies the edits; false if one cannot be printed.
+func (c *Config) fingerprint() (string, bool) {
+	var out strings.Builder
+	for _, key := range c.keys() {
+		if c.edits[key].text == "" {
+			return "", false
+		}
+		out.WriteString(key + "\x00" + c.edits[key].text + "\x00")
+	}
+	return out.String(), true
+}
+
+func (c *Config) buildRoot() *Node {
+	full := c.Value()
+	errs := map[string][]string{}
+	for _, cerr := range cueerrors.Errors(full.Validate()) {
+		labels := cerr.Path()
+		sels := make([]cue.Selector, 0, len(labels))
+		for _, label := range labels {
+			if idx, err := strconv.Atoi(label); err == nil { // a list element
+				sels = append(sels, cue.Index(idx))
+			} else {
+				sels = append(sels, cue.Str(label))
+			}
+		}
+		key := cue.MakePath(sels...).String()
+		errs[key] = append(errs[key], cerr.Error())
+	}
+	root := &Node{Label: "(root)", Errors: errs[""]}
+	classify(root, c.schema)
+	if alts, ok := structsOrScalars(c.schema); ok && root.Widget == Expr {
+		// Structs or a scalar (Azure Pipelines: the pipeline, or an empty
+		// document): the top level must be a menu, so it is the struct,
+		// or the variant of the structs.
+		if len(alts) == 1 {
+			root.Widget, root.Hint = Menu, ""
+			root.Children = c.build(full.Unify(alts[0]), cue.Path{}, errs)
+			return root
+		}
+		root.Hint = ""
+		classifyDisjunction(root, alts)
+	}
+	c.fill(root, full, c.schema, errs)
+	return root
+}
+
+// apply unifies the schema with the edits kept, gathered in one struct
+// written as CUE text: filling them in one by one rejects valid values
+// when the schema has matchIf next to a closed struct, as Dependabot's
+// has ("field not allowed"). The fields it was given come first in the
+// result: menus and the export put them back in the schema's order
+// (inOrder, exportValue).
 func (c *Config) apply(keep func(cue.Path) bool) cue.Value {
+	var src strings.Builder
+	kept := 0
+	for _, key := range c.keys() {
+		change := c.edits[key]
+		if !keep(change.path) {
+			continue
+		}
+		kept++
+		if change.text == "" {
+			return c.fillOneByOne(keep)
+		}
+		src.WriteString(labels(change.path) + ": " + change.text + "\n")
+	}
+	if kept == 0 {
+		return c.schema
+	}
+	edits := c.ctx.CompileString(src.String())
+	if edits.Err() != nil {
+		return c.fillOneByOne(keep)
+	}
+	return c.schema.Unify(edits)
+}
+
+// fillOneByOne is apply for edits that cannot be written as text.
+func (c *Config) fillOneByOne(keep func(cue.Path) bool) cue.Value {
 	val := c.schema
 	for _, key := range c.keys() {
 		if ed := c.edits[key]; keep(ed.path) {
@@ -246,15 +363,130 @@ func (c *Config) apply(keep func(cue.Path) bool) cue.Value {
 	return val
 }
 
+// fieldsAt lists the fields that the schema declares in the struct at
+// path, in order: none if it is no struct, or a disjunction.
+func (c *Config) fieldsAt(path cue.Path) []cue.Selector {
+	key := path.String()
+	if names, ok := c.fields[key]; ok {
+		return names
+	}
+	var names []cue.Selector
+	if val, _, found := find(c.schema, path); found {
+		iter, err := val.Fields(cue.Optional(true))
+		for err == nil && iter.Next() {
+			names = append(names, cue.Str(iter.Selector().Unquoted()))
+		}
+	}
+	c.fields[key] = names
+	return names
+}
+
+// inOrder sorts the fields of a menu as the first of decls that declares
+// them does: a field the user set would come first otherwise, as the
+// value lists the fields it was given before those it only declares.
+func inOrder(nodes []*Node, decls ...cue.Value) []*Node {
+	rank := map[string]int{}
+	for _, decl := range decls {
+		iter, err := decl.Fields(cue.Optional(true))
+		for err == nil && iter.Next() {
+			if _, seen := rank[iter.Selector().Unquoted()]; !seen {
+				rank[iter.Selector().Unquoted()] = len(rank)
+			}
+		}
+	}
+	rankOf := func(node *Node) int {
+		if pos, ok := rank[node.Label]; ok {
+			return pos
+		}
+		return len(rank) // undeclared (a key, a field of ...): last, as they are
+	}
+	slices.SortStableFunc(nodes, func(a, b *Node) int { return rankOf(a) - rankOf(b) })
+	return nodes
+}
+
+// exportValue is Value with the fields in the order the schema declares
+// them. A struct unified with the edits lists the fields it was given
+// first, so the edits are written as CUE text after declaring, as x?: _
+// (which adds nothing to a concrete value), the fields of each struct on
+// the way in the schema's order. Only for exporting: those declarations
+// would change how fields are classified.
+func (c *Config) exportValue() cue.Value {
+	var src strings.Builder
+	printed := map[string]bool{}
+	for _, key := range c.keys() {
+		change := c.edits[key]
+		if change.text == "" {
+			return c.Value()
+		}
+		sels := change.path.Selectors()
+		for depth := range sels {
+			prefix := cue.MakePath(sels[:depth]...)
+			if printed[prefix.String()] {
+				continue
+			}
+			printed[prefix.String()] = true
+			for _, name := range c.fieldsAt(prefix) {
+				src.WriteString(labels(cue.MakePath(append(slices.Clone(sels[:depth]), name)...)) + "?: _\n")
+			}
+		}
+		src.WriteString(labels(change.path) + ": " + change.text + "\n")
+	}
+	edits := c.ctx.CompileString(src.String())
+	if edits.Err() != nil {
+		return c.Value()
+	}
+	if val := c.schema.Unify(edits); val.Validate() == nil {
+		return val
+	}
+	return c.Value()
+}
+
+// labels writes path as CUE labels: a: "b-c": d.
+func labels(path cue.Path) string {
+	parts := make([]string, 0, len(path.Selectors()))
+	for _, sel := range path.Selectors() {
+		parts = append(parts, sel.String())
+	}
+	return strings.Join(parts, ": ")
+}
+
+// cueText is val as CUE source, or "" where it cannot be printed.
+func cueText(val cue.Value) string {
+	var text []byte
+	if !safe(func() { text, _ = cueformat.Node(val.Syntax()) }) {
+		return ""
+	}
+	return string(text)
+}
+
 // without is the config minus the edits that touch path (at, below or
 // above it): what the field looks like if the user had not touched it.
 func (c *Config) without(path cue.Path) cue.Value {
-	return c.apply(func(other cue.Path) bool { return !touches(other, path) })
+	var out []string
+	for _, key := range c.keys() {
+		if touches(c.edits[key].path, path) {
+			out = append(out, key)
+		}
+	}
+	memoKey := strings.Join(out, "\x00")
+	if val, ok := c.memo[memoKey]; ok && c.memo != nil {
+		return val
+	}
+	val := c.apply(func(other cue.Path) bool { return !touches(other, path) })
+	if c.memo != nil { // the fields of a struct all leave out the same edits
+		c.memo[memoKey] = val
+	}
+	return val
 }
 
+// edited reports whether an edit is at path, below or above it. An empty
+// struct above (a new map entry) changes no declaration below it: with
+// it, every field of a docker-compose service had to be looked up again.
 func (c *Config) edited(path cue.Path) bool {
 	for _, ed := range c.edits {
-		if touches(ed.path, path) {
+		creates := !under(path, ed.path) || ed.path.String() == path.String() ||
+			!isStruct(ed.val) || hasFields(ed.val)
+		if touches(ed.path, path) && creates {
 			return true
 		}
 	}
@@ -330,8 +562,17 @@ func (c *Config) buildNode(
 		decl, sel, _ = find(c.without(path), path)
 	}
 	node.Required = sel.ConstraintType() == cue.RequiredConstraint
+	// A required field has no value to look up until it is given one; a
+	// map or struct has no Value to tell it either.
+	node.Missing = node.Required && !owner.LookupPath(cue.MakePath(cue.Str(node.Label))).Exists()
 	node.Optional = sel.ConstraintType() == cue.OptionalConstraint
 	classify(node, decl)
+	if node.Widget == Expr { // the value can be vaguer than the declaration: a field of an allOf part
+		if found, _, ok := find(c.without(path), path); ok {
+			decl = found
+			classify(node, decl)
+		}
+	}
 	c.fill(node, fld, decl, errs)
 	return node
 }
@@ -340,7 +581,11 @@ func (c *Config) buildNode(
 func (c *Config) fill(node *Node, fld, decl cue.Value, errs map[string][]string) {
 	switch node.Widget {
 	case Menu:
-		node.Children = c.build(nonNull(fld), node.Path, errs)
+		val := nonNull(fld)
+		if parts, ok := allOfStruct(decl); ok {
+			val = val.Unify(parts)
+		}
+		node.Children = inOrder(c.build(val, node.Path, errs), nonNull(decl), val)
 	case Map:
 		c.fillMap(node, fld, decl, errs)
 	case List:
@@ -372,6 +617,9 @@ func nonNull(val cue.Value) cue.Value {
 	}
 	if op, args := expr(val); op == cue.OrOp {
 		alts := flattenOr(args)
+		if untypedStruct(alts) {
+			alts = slices.DeleteFunc(alts, anyOfKind)
+		}
 		alts = slices.DeleteFunc(alts, func(alt cue.Value) bool { return alt.IncompleteKind() == cue.NullKind })
 		if len(alts) == 1 {
 			return alts[0]
@@ -381,20 +629,30 @@ func nonNull(val cue.Value) cue.Value {
 }
 
 func (c *Config) fillVariant(node *Node, fld, decl cue.Value, errs map[string][]string) {
-	_, alts := expr(decl)
+	alts := variantAlts(decl)
 	chosen, hasDefault := fld.Default()
 	if !hasDefault {
 		chosen = fld
 	}
 	// Without a default, nothing is chosen while several variants fit.
 	undecided := !hasDefault && compatible(fld, alts) > 1
+	idx := chosenVariant(chosen, alts)
+	if idx >= 0 && !undecided && validatesOnly(decl) {
+		// matchN (oneOf) only validates: the value does not take the
+		// fields of the alternative it matches, as with A | B. (Doing it
+		// for A | B would repeat its disjunctions: *"a" | "b" & *"a" | "b".)
+		chosen = chosen.Unify(alts[idx])
+	}
 	node.Children = c.build(chosen, node.Path, errs)
+	if idx >= 0 {
+		node.Children = inOrder(node.Children, alts[idx])
+	}
 	if node.discr.String() != "" {
 		c.fillDiscriminator(node, chosen, undecided)
 		return
 	}
 	// No discriminator: a synthetic first entry chooses the variant.
-	if idx := chosenVariant(chosen, alts); idx >= 0 && !undecided {
+	if idx >= 0 && !undecided {
 		node.Value = node.Options[idx]
 	}
 	chooser := &Node{
@@ -474,7 +732,7 @@ func WriteFile(path string, data []byte, mode os.FileMode) error {
 // struct is kept as an edit: it creates a map entry with no fields yet.
 func leaves(val cue.Value, path cue.Path) []edit {
 	if val.IncompleteKind() != cue.StructKind {
-		return []edit{{val: val, path: path}}
+		return []edit{{val: val, path: path, text: cueText(val)}}
 	}
 	var out []edit
 	iter, err := val.Fields()
@@ -482,7 +740,7 @@ func leaves(val cue.Value, path cue.Path) []edit {
 		out = append(out, leaves(iter.Value(), child(path, iter.Selector()))...)
 	}
 	if len(out) == 0 {
-		return []edit{{val: val, path: path}}
+		return []edit{{val: val, path: path, text: cueText(val)}}
 	}
 	return out
 }
