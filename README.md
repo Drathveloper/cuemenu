@@ -91,7 +91,7 @@ The code passes `make lint` with no findings. Every `//nolint` states its reason
 
 ## Releases
 
-Every push to `master` runs lint, tests and the build (the go-build-tools workflow) and, if they pass, publishes a release with notes listing the commits since the previous one. The patch version goes up, or the minor or major one when a pushed commit message has a line that is just `#minor` or `#major` (a mention inside a sentence does not count). Each release has binaries for Linux and macOS (amd64, arm64) and Windows (amd64), with their `checksums.txt`; `make dist` builds the same files locally.
+Every push to `master` runs lint, tests and the build (the go-build-tools workflow) and, if they pass, publishes a release with notes listing the commits since the previous one. The patch version goes up, or the minor or major one when a pushed commit message has a line that is just `#minor` or `#major` (a mention inside a sentence does not count). Each release has binaries of `cuemenu` and `cuegen` for Linux and macOS (amd64, arm64) and Windows (amd64), with their `checksums.txt`; `make dist` builds the same files locally.
 
 ## Status
 

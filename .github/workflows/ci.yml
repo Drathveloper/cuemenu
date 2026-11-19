@@ -89,8 +89,9 @@ jobs:
             echo
             echo '```sh'
             echo "go install github.com/$GITHUB_REPOSITORY@$TAG"
+            echo "go install github.com/$GITHUB_REPOSITORY/cmd/cuegen@$TAG"
             echo '```'
             echo
-            echo 'Or download the binary for your platform below; `checksums.txt` has their SHA-256 sums.'
+            echo 'Or download the binaries for your platform below; `checksums.txt` has their SHA-256 sums.'
           } > notes.md
-          gh release create "$TAG" bin/cuemenu-* bin/checksums.txt --verify-tag --title "$TAG" --notes-file notes.md
+          gh release create "$TAG" bin/cuemenu-* bin/cuegen-* bin/checksums.txt --verify-tag --title "$TAG" --notes-file notes.md
