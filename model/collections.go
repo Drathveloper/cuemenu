@@ -129,22 +129,20 @@ func (c *Config) listItems(fld, decl cue.Value, path cue.Path, errs map[string][
 	if def, ok := fld.Default(); ok && !fld.IsConcrete() {
 		fld = def
 	}
-	written := c.Elems(path) // shown, and edited with e, as written
+	elems := c.elems(path) // shown, and edited with e, as written
 	var items []*Node
-	// By index: an element with an error makes the list bottom and List
-	// fails, but its elements, and their fields, can still be looked up.
 	for idx := 0; ; idx++ {
-		elemVal := fld.LookupPath(cue.MakePath(cue.Index(idx)))
-		if !elemVal.Exists() {
+		constraint := elemAt(decl, idx)
+		elemVal, ok := elemValue(fld, elems, constraint, idx)
+		if !ok {
 			break
 		}
 		item := &Node{Path: index(path, idx), Label: fmt.Sprintf("[%d]", idx)}
 		item.Errors = errs[item.Path.String()]
-		constraint := elemAt(decl, idx)
 		classify(item, constraint)
 		c.fill(item, elemVal, constraint, errs)
-		if item.Value == "" && idx < len(written) {
-			item.Value = written[idx]
+		if item.Value == "" && idx < len(elems) {
+			item.Value = leafValue(elems[idx])
 		}
 		items = append(items, item)
 	}
@@ -152,6 +150,20 @@ func (c *Config) listItems(fld, decl cue.Value, path cue.Path, errs map[string][
 		tmpl.Path = index(path, len(items))
 	}
 	return items, tmpl
+}
+
+// elemValue is element idx of the list fld, looked up by index: an
+// element with an error makes the list bottom and List fails, but its
+// elements, and their fields, can still be looked up. An element left out
+// of the value while something it is in cannot be decided (a matchN
+// waiting for the element's required fields) is taken as written, so
+// that they can be filled in.
+func elemValue(fld cue.Value, written []cue.Value, constraint cue.Value, idx int) (cue.Value, bool) {
+	val := fld.LookupPath(cue.MakePath(cue.Index(idx)))
+	if !val.Exists() && idx < len(written) {
+		val = constraint.Unify(written[idx])
+	}
+	return val, val.Exists()
 }
 
 // elemAt is the constraint of element idx of the list declared as list:
@@ -180,7 +192,11 @@ func (c *Config) Elems(path cue.Path) []string {
 func (c *Config) elems(path cue.Path) []cue.Value {
 	list, ok := c.written(path)
 	if !ok {
-		list = c.ctx.CompileString(leafValue(c.Value().LookupPath(path)))
+		cur, _, found := find(c.Value(), path) // also an optional field
+		if found && cur.Validate(cue.Concrete(true)) != nil {
+			return c.placeholders(cur)
+		}
+		list = c.ctx.CompileString(leafValue(cur))
 	}
 	var out []cue.Value
 	iter, err := list.List()
@@ -188,6 +204,32 @@ func (c *Config) elems(path cue.Path) []cue.Value {
 		out = append(out, iter.Value())
 	}
 	return out
+}
+
+// placeholders are the elements of a list not concrete yet, as listItems
+// shows them: [_, ...] (JSON Schema's minItems) or [int, string] ask for
+// elements before any is written. Each is its value if it has one, else
+// what it still needs.
+func (c *Config) placeholders(list cue.Value) []cue.Value {
+	if def, ok := list.Default(); ok {
+		list = def
+	}
+	var out []cue.Value
+	for idx := 0; ; idx++ {
+		elem := list.LookupPath(cue.MakePath(cue.Index(idx)))
+		if !elem.Exists() {
+			return out
+		}
+		text := leafValue(elem)
+		switch {
+		case text != "":
+		case elem.IncompleteKind() == cue.StructKind:
+			text = "{}"
+		default:
+			text = "_"
+		}
+		out = append(out, c.ctx.CompileString(text))
+	}
 }
 
 // written is what the user wrote at path: an edit at path or above it (a
@@ -245,12 +287,53 @@ func (c *Config) pruneElem(list cue.Path, idx int, kept, fresh []edit) []edit {
 			}
 		}
 	}
-	return append(kept, fresh...)
+	return declOrder(append(kept, fresh...), constraint)
+}
+
+// declOrder sorts the leaves of an element as decl declares them, so that
+// the element reads the same however it was edited, and after reloading.
+func declOrder(parts []edit, decl cue.Value) []edit {
+	rank := func(path cue.Path) []int {
+		var out []int
+		val := decl
+		for _, sel := range path.Selectors() {
+			pos, idx := -1, 0
+			iter, err := val.Fields(cue.Optional(true))
+			for ; err == nil && iter.Next(); idx++ {
+				if iter.Selector().Unquoted() == sel.Unquoted() {
+					pos = idx
+					break
+				}
+			}
+			if pos < 0 { // undeclared (a key, a field of ...): after, as they are
+				return append(out, idx)
+			}
+			out = append(out, pos)
+			val = iter.Value()
+		}
+		return out
+	}
+	slices.SortStableFunc(parts, func(a, b edit) int { return slices.Compare(rank(a.path), rank(b.path)) })
+	return parts
 }
 
 // rebuild makes a struct of leaves, or any value if whole (the leaf is
-// the element itself).
+// the element itself). It is compiled from text when it can: a value
+// built with FillPath prints its fields sorted by name (Syntax(Final)).
 func (c *Config) rebuild(parts []edit, whole bool) cue.Value {
+	if !whole {
+		var src strings.Builder
+		for _, ed := range parts {
+			if ed.text == "" {
+				src.Reset()
+				break
+			}
+			src.WriteString(labels(ed.path) + ": " + ed.text + "\n")
+		}
+		if val := c.ctx.CompileString(src.String()); src.Len() > 0 && val.Err() == nil {
+			return val
+		}
+	}
 	val := c.ctx.CompileString("{}")
 	if whole {
 		val = c.ctx.CompileString("_")

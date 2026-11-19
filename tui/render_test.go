@@ -50,7 +50,7 @@ func TestNullListEditing(t *testing.T) {
 	}
 	m := tui.New(model.New(v), dir+"/.config.cue", "s")
 	press(t, m, "enter", "'a", "'x", "enter") // open the list, add "x"
-	if got := values(m.Container()); len(got) != 1 || got[0] != `"x"` {
+	if got := values(m.Container()); len(got) != 1 || got[0] != cueX {
 		t.Fatalf("add to a null list: %v", got)
 	}
 	press(t, m, "esc", "'r")
@@ -93,7 +93,7 @@ func TestRootContainers(t *testing.T) {
 	if n := m.Selected(); n == nil || !n.Chooser {
 		t.Fatalf("root variant should start on its chooser: %+v", n)
 	}
-	press(t, m, "enter", "down", "enter", `'[{image: "x"}]`, "enter")
+	press(t, m, "enter", "down", "enter", "esc") // chosen with the list empty, opened
 	if got := m.Container().Value; got != "containers" {
 		t.Errorf("root variant after choosing: %q (%s)", got, m.Status())
 	}
@@ -226,7 +226,7 @@ func TestNewKeyPrompt(t *testing.T) {
 func TestNewVariantEntry(t *testing.T) {
 	m := load(t, `els: [string]: {kind: "a", x?: int} | {kind: "b", y?: string}`)
 	press(t, m, "enter", "'a", "'p1", "enter")
-	if c := m.Container(); m.Mode() != "browse" || c == nil || c.Path.String() != "els.p1" || c.Widget != model.Variant {
+	if c := m.Container(); m.Mode() != modeBrowse || c == nil || c.Path.String() != "els.p1" || c.Widget != model.Variant {
 		t.Fatalf("new variant entry: mode %s, container %+v (%s)", m.Mode(), c, m.Status())
 	}
 }

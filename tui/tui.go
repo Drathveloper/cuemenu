@@ -36,6 +36,7 @@ type Model struct {
 	file    string             // where Save writes
 	title   string             // shown in the header
 	status  string             // last message or error
+	saved   string             // the edits as last saved (or loaded)
 	root    *model.Node        // the menu tree: the whole configuration
 	stack   []frame            // open menus, root first
 	results []*model.Node      // searching: matches
@@ -50,10 +51,12 @@ type Model struct {
 
 // New returns the editor for cfg, saving to file.
 func New(cfg *model.Config, file, title string) *Model {
-	return &Model{
+	m := &Model{
 		cfg: cfg, file: file, title: title,
 		root: cfg.Root(), stack: []frame{{}}, input: textinput.New(),
 	}
+	m.saved, _ = m.edits()
+	return m
 }
 
 // Init implements tea.Model.
@@ -181,7 +184,8 @@ func (m *Model) changed() {
 	if node := m.selected(); node != nil {
 		path = node.Path.String()
 	}
-	m.dirty = true
+	text, ok := m.edits()
+	m.dirty = !ok || text != m.saved
 	m.root = m.cfg.Root()
 	items := m.items()
 	if idx := slices.IndexFunc(items, func(n *model.Node) bool { return n.Path.String() == path }); idx >= 0 {
@@ -195,8 +199,17 @@ func (m *Model) save() bool {
 		return false
 	}
 	m.dirty = false
+	m.saved, _ = m.edits()
 	m.status = "Saved to " + m.file
 	return true
+}
+
+// edits is the configuration as Save writes it. It is unsaved if it
+// differs from what was saved: a change undone, or one that changes
+// nothing, leaves nothing to save.
+func (m *Model) edits() (string, bool) {
+	text, err := m.cfg.Text()
+	return string(text), err == nil
 }
 
 func (m *Model) quit() tea.Cmd {

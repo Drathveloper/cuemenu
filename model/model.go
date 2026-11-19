@@ -307,16 +307,19 @@ func neutral(arg cue.Value, operator cue.Op) bool {
 //   - definitions or lets next to it, which declare no fields: at the top
 //     of a file, "#A: {…}, #B: {…}, #A | #B" is {#A, #B} & (#A | #B);
 //   - a type every alternative has, as in Go-generated enums:
-//     string & ("a" | "b").
+//     string & ("a" | "b");
+//   - the same disjunction again: a list element's field, when every
+//     alternative of an undecided variant declares the list.
 func embeddedOr(args []cue.Value) ([]cue.Value, bool) {
 	var alts, types []cue.Value
 	for _, arg := range args {
 		operator, sub := expr(arg)
 		switch {
-		case operator == cue.OrOp && alts == nil:
-			alts = sub
 		case operator == cue.OrOp:
-			return nil, false
+			if alts != nil && !sameValues(alts, sub) {
+				return nil, false
+			}
+			alts = sub // the same one again: two alternatives of the root declare it
 		case neutral(arg, operator):
 		case isScalarType(arg):
 			types = append(types, arg)
@@ -328,6 +331,10 @@ func embeddedOr(args []cue.Value) ([]cue.Value, bool) {
 		return nil, false
 	}
 	return alts, alts != nil
+}
+
+func sameValues(a, b []cue.Value) bool {
+	return slices.EqualFunc(a, b, func(x, y cue.Value) bool { return format(x) == format(y) })
 }
 
 // isScalarType reports whether val is a type such as string or int.

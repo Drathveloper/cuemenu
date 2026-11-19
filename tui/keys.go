@@ -145,6 +145,9 @@ func hasMenu(node *model.Node) bool {
 // next.
 func (m *Model) addEntry(mapNode *model.Node) {
 	m.editWith(&model.Node{Label: "new key", Hint: mapNode.Hint}, false, func(key string) error {
+		if key == "" { // empty adds nothing, as in a list
+			return nil
+		}
 		entry, err := m.cfg.Entry(mapNode.Path, key)
 		if err != nil {
 			return fmt.Errorf("new entry: %w", err)
@@ -259,7 +262,7 @@ func (m *Model) valueCommit(node *model.Node, set func(string) error) func(strin
 	asExpr := !plainText(node)
 	return func(text string) error {
 		switch {
-		case text == "" && set == nil && asExpr:
+		case text == "" && set == nil: // "" itself is typed with e
 			m.cfg.Unset(node.Path)
 			return nil
 		case text == "" && set != nil:
@@ -293,6 +296,13 @@ func (m *Model) chooseVariant(node *model.Node) func(string) error {
 		ask, err := m.cfg.Choose(node.Path, slices.Index(node.Options, opt))
 		if err != nil {
 			return fmt.Errorf("choosing %q: %w", opt, err)
+		}
+		if ask != nil && ask.Widget == model.List && m.cfg.SetExpr(ask.Path, "[]") == nil {
+			m.changed() // chosen with the list empty: open it to add elements
+			m.jump(ask)
+			m.stack = append(m.stack, frame{path: ask.Path.String()})
+			m.status = fmt.Sprintf("Chose %q: a adds elements to %s", opt, ask.Path)
+			return nil
 		}
 		if ask != nil {
 			m.editOrChoose(ask, nil)
@@ -333,7 +343,7 @@ func (m *Model) editWith(node *model.Node, asExpr bool, commit func(string) erro
 	m.mode, m.target, m.asExpr, m.commit = editing, node, asExpr, commit
 	val := node.Value
 	if val == "" && asExpr && len(node.Path.Selectors()) > 0 {
-		if current := m.cfg.Value().LookupPath(node.Path); current.IsConcrete() {
+		if current := m.cfg.Value().LookupPath(node.Path); current.Err() == nil && current.IsConcrete() {
 			val = fmt.Sprint(current)
 		}
 	}
@@ -396,7 +406,7 @@ func (m *Model) searchKey(msg tea.KeyPressMsg) tea.Cmd {
 		m.opt = max(0, m.opt-1)
 		return nil
 	case keyDown:
-		m.opt = min(len(m.results)-1, m.opt+1)
+		m.opt = max(0, min(len(m.results)-1, m.opt+1))
 		return nil
 	case keyEnter:
 		m.mode = browse

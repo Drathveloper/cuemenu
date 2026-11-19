@@ -1017,3 +1017,69 @@ func TestFieldOrder(t *testing.T) {
 		t.Errorf("export: %s", got)
 	}
 }
+
+// A list element reads in the schema's order however its fields were
+// edited, and the same after saving and loading it again.
+func TestElementOrder(t *testing.T) {
+	const schema = `l: [...{z: string, m?: string, a?: *"x" | "y"}]`
+	c := compile(t, schema)
+	if err := c.SetList(cue.ParsePath("l"), []string{"{}"}); err != nil {
+		t.Fatal(err)
+	}
+	set(t, c, "l[0].a", "y")
+	set(t, c, "l[0].m", "m")
+	set(t, c, "l[0].z", "z")
+	want := "{\n\tz: \"z\"\n\tm: \"m\"\n\ta: \"y\"\n}"
+	if got := c.Elems(cue.ParsePath("l")); len(got) != 1 || got[0] != want {
+		t.Fatalf("edited: %q", got)
+	}
+	file := filepath.Join(t.TempDir(), ".config.cue")
+	if err := c.Save(file); err != nil {
+		t.Fatal(err)
+	}
+	again := compile(t, schema)
+	if _, err := again.Load(file); err != nil {
+		t.Fatal(err)
+	}
+	if got := again.Elems(cue.ParsePath("l")); len(got) != 1 || got[0] != want {
+		t.Fatalf("reloaded: %q", got)
+	}
+}
+
+// A list that must have elements ([_, ...], JSON Schema's minItems) shows
+// them before any is written, and Elems has one per element shown, so
+// that they can be edited.
+func TestMinItemsList(t *testing.T) {
+	c := compile(t, `assignees?: [...string] & [_, ...]`)
+	if n := tree(c)["assignees[0]"]; n == nil {
+		t.Fatal("element 0 not shown")
+	}
+	elems := c.Elems(cue.ParsePath("assignees"))
+	if len(elems) != 1 {
+		t.Fatalf("elems: %q", elems)
+	}
+	elems[0] = cueX
+	if err := c.SetList(cue.ParsePath("assignees"), elems); err != nil {
+		t.Fatal(err)
+	}
+	if got := exportJSON(t, c); got != `{"assignees":["x"]}` {
+		t.Errorf("export: %s", got)
+	}
+}
+
+// An element whose required fields are missing can leave out of the value
+// the list it is in (docker-compose's develop.watch, under a matchN that
+// cannot be decided yet). It is still shown as written, to be filled in.
+func TestElementOutOfValue(t *testing.T) {
+	c := compile(t, "#d: null | close({w?: [...close({p!: string})]})\ns: [string]: matchN(1, [{...}]) & (null | {d?: #d, ...})")
+	if err := c.SetList(cue.ParsePath("s.x.d.w"), []string{"{}"}); err != nil {
+		t.Fatal(err)
+	}
+	if n := tree(c)["s.x.d.w[0].p"]; n == nil || !n.Required {
+		t.Fatalf("element field not shown: %+v", n)
+	}
+	set(t, c, "s.x.d.w[0].p", "a")
+	if got := exportJSON(t, c); got != `{"s":{"x":{"d":{"w":[{"p":"a"}]}}}}` {
+		t.Errorf("export: %s", got)
+	}
+}

@@ -12,7 +12,11 @@ import (
 	"github.com/Drathveloper/cuemenu/tui"
 )
 
-const modeEditing = "editing"
+const (
+	modeEditing = "editing"
+	modeBrowse  = "browse"
+	cueX        = `"x"`
+)
 
 var named = map[string]rune{
 	"up": tea.KeyUp, "down": tea.KeyDown, "enter": tea.KeyEnter,
@@ -163,7 +167,7 @@ func TestListEditing(t *testing.T) {
 	// List of structs: a new element is added empty and opened as a menu
 	// of its fields. Only what is set is saved, not the defaults.
 	press(t, m, "esc", "'/", "'filters", "enter", "enter", "'a")
-	if c := m.Container(); m.Mode() != "browse" || c == nil || c.Path.String() != "log.filters[0]" || len(c.Children) != 2 {
+	if c := m.Container(); m.Mode() != modeBrowse || c == nil || c.Path.String() != "log.filters[0]" || len(c.Children) != 2 {
 		t.Fatalf("struct element should open as a menu: mode %s %+v (%s)", m.Mode(), c, m.Status())
 	}
 	press(t, m, "enter", "'db", "enter") // module
@@ -278,5 +282,70 @@ func TestFixedRequired(t *testing.T) {
 	press(t, m, "enter")
 	if m.Status() == "" {
 		t.Error("a given constant is just fixed")
+	}
+}
+
+// The editor of an element not added yet starts empty: looking it up gives
+// an error, which is "concrete" too, and was typed into the editor.
+func TestAddSecondExprElement(t *testing.T) {
+	m := load(t, `ports?: [...(int | string)]`)
+	press(t, m, "enter", "'a", "'8080:80", "enter", "'a")
+	if got := m.Input(); got != "" {
+		t.Fatalf("new element editor starts with %q", got)
+	}
+	press(t, m, "'3000", "enter")
+	if got := values(m.Container()); strings.Join(got, " ") != `"8080:80" 3000` {
+		t.Fatalf("elements: %q (%s)", got, m.Status())
+	}
+}
+
+// ⏎ on an empty text field puts it back to the schema's value, as the
+// editor says, and an empty key adds no map entry.
+func TestEmptyText(t *testing.T) {
+	m := load(t, "name: *\"x\" | string\ncert!: string\nm: [string]: string")
+	press(t, m, "enter", "ctrl+u", "enter")
+	if n := m.Selected(); n.Set || n.Value != cueX {
+		t.Fatalf("empty text: %+v", n)
+	}
+	press(t, m, "down", "enter", "enter")
+	if n := m.Selected(); n.Set || !n.Missing {
+		t.Fatalf("empty required text: %+v", n)
+	}
+	press(t, m, "down", "enter", "'a", "enter")
+	if m.Mode() != modeBrowse || len(m.Container().Children) != 0 {
+		t.Fatalf("empty key: mode %s, %d entries (%s)", m.Mode(), len(m.Container().Children), m.Status())
+	}
+}
+
+// Unsaved means different from what was saved: a change undone, or one
+// that changes nothing, asks for no save.
+func TestUnsavedOnlyIfChanged(t *testing.T) {
+	m := load(t, "name: *\"x\" | string\nm: [string]: string")
+	press(t, m, "enter", "ctrl+u", "enter") // back to the default it has
+	press(t, m, "down", "enter", "'a", "enter")
+	if strings.Contains(m.View().Content, "unsaved") {
+		t.Fatal("nothing changed, yet unsaved")
+	}
+	press(t, m, "esc", "up", "enter", "'y", "enter")
+	if !strings.Contains(m.View().Content, "unsaved") {
+		t.Fatal("a change not marked unsaved")
+	}
+	press(t, m, "'r")
+	if strings.Contains(m.View().Content, "unsaved") {
+		t.Fatal("a change undone, yet unsaved")
+	}
+}
+
+// A variant told apart by a list (KubeVela's container-image) is chosen
+// with the list empty, opened to add elements; their enums stay choices.
+func TestVariantByList(t *testing.T) {
+	m := load(t, `#x: {p: *"" | "x" | "y", q: string}`+"\n"+`#x | close({c: [...#x]})`)
+	press(t, m, "enter", "down", "enter")
+	if c := m.Container(); m.Mode() != modeBrowse || c == nil || c.Path.String() != "c" {
+		t.Fatalf("list not opened: mode %s, %+v (%s)", m.Mode(), c, m.Status())
+	}
+	press(t, m, "'a")
+	if n := m.Selected(); n == nil || n.Label != "p" || n.Widget != model.Choice {
+		t.Fatalf("element enum: %+v", n)
 	}
 }

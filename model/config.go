@@ -216,6 +216,15 @@ func (c *Config) Load(path string) ([]string, error) {
 
 // Save writes the edits as CUE, readable only by the owner.
 func (c *Config) Save(path string) error {
+	data, err := c.Text()
+	if err != nil {
+		return err
+	}
+	return WriteFile(path, data, configMode)
+}
+
+// Text is the edits as CUE, as Save writes them.
+func (c *Config) Text() ([]byte, error) {
 	saved := c.ctx.CompileString("{}")
 	for _, key := range c.keys() {
 		saved = saved.FillPath(c.edits[key].path, c.edits[key].val)
@@ -226,9 +235,9 @@ func (c *Config) Save(path string) error {
 	}
 	data, err := cueformat.Node(file)
 	if err != nil {
-		return fmt.Errorf("formatting the configuration: %w", err)
+		return nil, fmt.Errorf("formatting the configuration: %w", err)
 	}
-	return WriteFile(path, append([]byte(header), data...), configMode)
+	return append([]byte(header), data...), nil
 }
 
 // Check reports what keeps the configuration from being exported:
