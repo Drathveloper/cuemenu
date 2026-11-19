@@ -182,6 +182,36 @@ Tried on the curated modules of the CUE Central Registry (`cue.dev/x`: GitHub Ac
 - **Variant told apart by a list** (KubeVela's `container-image`: `#P | close({containers: [...#P]})`): choosing it asked for the whole list as CUE, and ⏎ chose nothing. It is now chosen with the list empty, which opens to add elements. The enums of those elements showed as text: with the variant undecided, their declaration is the same disjunction twice (`D & D`, one per alternative), which `embeddedOr` now accepts.
 - **Not cuemenu:** Timoni's redis example declares `imagePullSecrets?: [...corev1.LocalObjectReference]`, a name its k8s package does not have (only `#LocalObjectReference`), so its elements cannot be filled in; `cue eval` leaves the reference unresolved too.
 
+## cuegen: Go code from the schema
+
+`cuegen` (`cmd/cuegen`, package `gen`) generates the Go types that receive a configuration: structs with `json` and `validate` tags, `NewX` with the defaults, `UnmarshalJSON` that decodes over them, `ParseJSON`, `ParseYAML` (through JSON, so there is one set of tags) and `Validate`, which runs go-playground/validator and then the generated checks.
+
+**How the schema is read.** The structure (fields, `?` and `!`, patterns, list elements, disjunctions of structs) comes from the value API; the constraints of a scalar come from its evaluated text parsed as CUE (`*3000 | uint & >=1 & <=65535`), read as alternatives of conjuncts. `Syntax()` is no use there: it keeps references to definitions as `let` clauses, and `Expr()` hides the disjunction of a field with a default (`*"localhost" | strings.MinRunes(3)` is a `NoOp`). Disjunctions, `oneOf`/`anyOf` and `allOf` are read with the model's own logic (`model.Disjuncts`, `model.AllOf`).
+
+**Decisions.**
+
+- A field that may be left out without a default (`!`, `?`, or a regular field with no default) is a pointer: validator's `required` rejects zero values, but `port!: int` accepts `0`.
+- `if` branches: the enum and bool fields of a struct with a comprehension are filled in with each value in turn (and with the literals its `if` conditions compare them with: `if kind == "Resources"` when `kind` is any string), and the fields that come and go become pointers. Code then requires them, forbids them (`helm?: _|_`) or sets their default after decoding, from the value decoded. The comprehensions are found in the `Raw` syntax, following references, since that of a reference is just the reference.
+- Variants are interfaces. With a field that every alternative fixes to a different constant, that field picks the variant; else each variant is decoded and validated in turn, and the value is the one it fits, or the default if it fits several, as CUE resolves a disjunction (Grafana's heatmap legend fits both its variants: the default wins). Identical alternatives are one.
+- Keys a struct with fields does not declare but its pattern allows (Helm's `annotations`: the `artifacthub.io/…` ones and any other) are kept in a `Rest` map, decoded and written back.
+- A field the schema computes is decoded into a pointer and not checked: an interpolation, alone or in a conjunction (`#Path & "\(Name).yaml"`), a `[for …]` list, or a reference to another field of the configuration (Holos' `name: Name`). A reference is to a field of the configuration if its path, which is relative to the struct it is in, exists in the root generated; one through a definition (`#."relative-path-modes"`) or out of the root (Grafana's `type: ScaleDistribution` next to the `FieldConfig` generated) is a type.
+- A struct is named after its definition, or its path. Structs that are equal are one type: by the position of their definition, else by a fingerprint of their fields with `?`/`!`, list elements and alternatives a few levels deep. The fingerprint has to include optional fields, which `%v` leaves out (two structs with only optional fields printed `{}` and became one type), and `%#v` panics on some schemas (golangci's `let` names). Without it, Grafana's recursive dashboard layouts grew to 92,000 lines; with it, 4,000.
+- A struct is closed if `Allows` rejects an unknown field. Next to a validator such as `matchN`, among the parts of its conjunction however nested, `Allows` is wrong either way (kyverno's `match` is open, Dependabot's root closed), and there an unknown field is filled in and the result validated. That is no rule for every struct: filling a field into a part of a closed definition is accepted, and only unification of the whole document rejects it.
+- An optional field that is `_|_` (Holos: `helm?: _|_` in a task of another kind) is left out of the struct.
+- What the code cannot check is warned about on stderr, never accepted silently.
+
+**Differential test.** `examples/webapp/config` checks 70 hand-written inputs; `TestCorpus` (`CUEGEN_CORPUS=FILE`, `CUEGEN_INPUTS=N`) generates the code of each schema, builds it with a small `main`, and feeds it random inputs made from the schema (typical values, the schema's own literals, wrong kinds, `null`, unknown keys) next to CUE: both must accept the same inputs and decode them to the same configuration. Over the 235 schemas it found, in order:
+
+- A schema too deep or recursive with no definition names never ended: generation is cut at 32 levels, and equal structs are one type.
+- `null` decoded into Go's zero value or `nil` where CUE rejects it: `checkKeys` rejects it per key (and in the elements of lists and maps of scalars), and `UnmarshalJSON` of a struct rejects `null` itself; nullable structs in lists and maps are pointers.
+- `IncompleteKind` is bottom for a value with an error not resolved yet (`matchN(…) & {…}`, an `if` on a field not given), and `_` for a `matchN`: the kind comes from the parts, the alternatives, or the fields.
+- `oneOf` with required keys next to a struct (`matchN(1, [{a!: _}, {b!: _}])`), common in CRDs, is generated as a count of the alternatives given.
+- Disjunctions of several kinds (`string | {…}`, `int | string`) are `any` with a check of the JSON kind.
+- Patterns of an open struct do not restrict its keys: `[=~"^X-"]: string` allows any other key with any value. Only closed structs check their keys.
+- A field the schema computes with a comprehension (Holos' `spec.components: [for …]`) is decoded, not computed, and warned about.
+
+With 150 random inputs per schema, 15 of the 235 schemas still accept inputs CUE rejects, never the reverse, all at places a warning names: alternatives of several kinds whose contents are not checked (`int | string`, `string | [...string]`), JSON Schema's `not`, a `oneOf` whose alternatives are told apart by more than keys. Three decode differently: the fields of an open struct that it does not declare are not kept (the default of the heatmap legend keeps `width` in CUE), and fields an `if` fills in from other fields (Holos' `metadata.labels`) are not computed.
+
 ## Tooling
 
 - Build, test and lint come from [go-build-tools](https://github.com/Drathveloper/go-build-tools) as a submodule in `.parent`. `make lint` passes with no findings under its strict golangci-lint configuration.

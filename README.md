@@ -58,6 +58,24 @@ A field's documentation comes from its `//` comments. `@menu(secret)` hides the 
 - **Variants without a discriminator field:** use closed definitions (`#A | #B`). With open structs, CUE cannot tell which variant was chosen.
 - **Imports:** do not name a field like an import (`tls: tls.#Settings` hides the import); give the import an alias (`tlscfg "…/tls"`).
 
+## Generating Go code: cuegen
+
+`cuegen` writes the Go types that receive the configuration a schema describes, so the program that reads it takes its defaults and its validation from the same CUE package:
+
+```sh
+go install github.com/Drathveloper/cuemenu/cmd/cuegen@latest
+cuegen [-pkg config] [-type Config] [-e '#Config'] [-o config_gen.go] DIR
+```
+
+The generated code has `ParseJSON`, `ParseYAML` and `Validate`, and needs `github.com/go-playground/validator/v10` and `go.yaml.in/yaml/v3`. `examples/webapp/config` is what it generates for the example (`go generate` updates it); its test gives the same inputs to CUE and to the generated code and checks that they agree, on what is valid and on what is decoded.
+
+- **Defaults:** decoding starts from `NewConfig()`, so what the input leaves out keeps the schema's default. Fields that only exist under an `if` get theirs after decoding, from the field they depend on.
+- **Validator tags** where they can say it: kinds and bounds (`gte`, `lt`…), enums (`oneof`), required fields, rune and item counts (`strings.MinRunes`, `list.MinItems`, `[_, ...]`), `net.IP`, prefixes and suffixes. Required and optional fields are pointers, so that a `0` or `""` given is told from one left out.
+- **Generated code** for the rest: regular expressions, `time.Duration`, `time.Time`, `net.URL`, what an `if` branch requires or forbids, JSON Schema's oneOf of required keys, unknown fields of closed structs, `null` where the schema does not allow it, map key patterns.
+- **Variants** (`#A | #B`, JSON Schema's oneOf) are Go interfaces: decoding picks the variant by its discriminator field, or else, as CUE does, the one the value fits (the default if it fits several).
+- **Patterns next to fields** (`{name: string, [string]: string}`): the keys the struct does not declare go to a `Rest` map, and are written back.
+- **Warnings:** what the code does not check is printed as a warning, never accepted silently. Examples: fields the schema computes (`"\(a)/\(b)"`, `[for …]`), alternatives of several kinds (only the kind is checked), JSON Schema's `not`.
+
 ## Development
 
 Build, test and lint tasks come from [go-build-tools](https://github.com/Drathveloper/go-build-tools), included as a submodule in `.parent`:

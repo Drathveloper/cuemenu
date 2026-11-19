@@ -182,6 +182,22 @@ func isConstScalar(val cue.Value) bool {
 	return val.IsConcrete() && val.IncompleteKind()&(cue.StructKind|cue.ListKind) == 0
 }
 
+// Disjuncts returns the alternatives of val if it is a disjunction: one
+// written with |, behind a reference to another package or embedded in a
+// conjunction, or JSON Schema's oneOf and anyOf as cue imports them
+// (matchN). Nested disjunctions are flattened.
+func Disjuncts(val cue.Value) ([]cue.Value, bool) {
+	if operator, args := expr(val); operator == cue.OrOp {
+		return flattenOr(args), true
+	}
+	return nil, false
+}
+
+// AllOf returns the struct that JSON Schema's allOf requires of val, as
+// cue imports it (matchN(N, [A, B]) with N all of them), if val has one:
+// the parts unified, which matchN only checks.
+func AllOf(val cue.Value) (cue.Value, bool) { return allOfStruct(val) }
+
 // expr is val.Expr(), seeing through a reference into another package
 // (pkg.Name), which Expr reports as a selector instead of what it names.
 func expr(val cue.Value) (cue.Op, []cue.Value) {
