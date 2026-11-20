@@ -14,10 +14,12 @@ import (
 
 	"cuelang.org/go/cue"
 	"cuelang.org/go/cue/ast"
+	"cuelang.org/go/cue/ast/astutil"
 	"cuelang.org/go/cue/cuecontext"
 	cueerrors "cuelang.org/go/cue/errors"
 	cueformat "cuelang.org/go/cue/format"
 	"cuelang.org/go/cue/literal"
+	"cuelang.org/go/cue/token"
 	"cuelang.org/go/encoding/yaml"
 )
 
@@ -242,21 +244,29 @@ func (c *Config) Text() ([]byte, error) {
 
 // Check reports what keeps the configuration from being exported:
 // required fields without value, values not concrete yet and conflicts,
-// with the position in the schema of each.
+// with the position in the schema of each. A required secret without
+// value is no error: the environment is expected to give it.
 func (c *Config) Check() error {
 	err := c.Value().Validate(cue.Concrete(true))
 	if err == nil {
 		return nil
 	}
+	fromEnv := c.fromEnv()
 	// The same error can come from many places, e.g. one per "if kind ==
 	// …" while kind is not chosen: each message is shown once.
 	var unique cueerrors.Error
 	seen := map[string]bool{}
 	for _, cerr := range cueerrors.Errors(err) {
+		if fromEnv[errPath(cerr)] {
+			continue
+		}
 		if !seen[cerr.Error()] {
 			seen[cerr.Error()] = true
 			unique = cueerrors.Append(unique, cerr)
 		}
+	}
+	if unique == nil {
+		return nil
 	}
 	return fmt.Errorf("%w:\n%s", ErrIncomplete, cueerrors.Details(unique, nil))
 }
@@ -268,6 +278,12 @@ func (c *Config) Export(encoding string) ([]byte, error) {
 		return nil, err
 	}
 	val := c.exportValue()
+	if len(c.fromEnv()) > 0 {
+		var err error
+		if val, err = c.withoutAbsent(val); err != nil {
+			return nil, err
+		}
+	}
 	switch encoding {
 	case "json":
 		data, err := json.MarshalIndent(val, "", "  ")
@@ -283,6 +299,42 @@ func (c *Config) Export(encoding string) ([]byte, error) {
 		return data, nil
 	}
 	return nil, fmt.Errorf("%w: %q", ErrFormat, encoding)
+}
+
+// fromEnv is the set of paths of required secrets without value.
+func (c *Config) fromEnv() map[string]bool {
+	paths := map[string]bool{}
+	var walk func([]*Node)
+	walk = func(nodes []*Node) {
+		for _, node := range nodes {
+			if node.Secret && node.Missing {
+				paths[node.Path.String()] = true
+			}
+			walk(node.Children)
+		}
+	}
+	walk(c.Tree())
+	return paths
+}
+
+// withoutAbsent drops the required fields without value from val, which
+// Check allowed: the secrets the environment gives.
+func (c *Config) withoutAbsent(val cue.Value) (cue.Value, error) {
+	node := astutil.Apply(val.Syntax(cue.Final(), cue.Concrete(true)), func(cur astutil.Cursor) bool {
+		if field, ok := cur.Node().(*ast.Field); ok && field.Constraint == token.NOT {
+			cur.Delete()
+		}
+		return true
+	}, nil)
+	expr, ok := node.(ast.Expr)
+	if !ok {
+		return val, nil
+	}
+	out := c.ctx.BuildExpr(expr)
+	if err := out.Err(); err != nil {
+		return val, fmt.Errorf("dropping secrets from the export: %w", err)
+	}
+	return out, nil
 }
 
 // fingerprint identifies the edits; false if one cannot be printed.
@@ -301,16 +353,7 @@ func (c *Config) buildRoot() *Node {
 	full := c.Value()
 	errs := map[string][]string{}
 	for _, cerr := range cueerrors.Errors(full.Validate()) {
-		labels := cerr.Path()
-		sels := make([]cue.Selector, 0, len(labels))
-		for _, label := range labels {
-			if idx, err := strconv.Atoi(label); err == nil { // a list element
-				sels = append(sels, cue.Index(idx))
-			} else {
-				sels = append(sels, cue.Str(label))
-			}
-		}
-		key := cue.MakePath(sels...).String()
+		key := errPath(cerr)
 		errs[key] = append(errs[key], cerr.Error())
 	}
 	root := &Node{Label: "(root)", Errors: errs[""]}
@@ -779,6 +822,20 @@ func errorSet(val cue.Value) map[string]bool {
 		set[cerr.Error()] = true
 	}
 	return set
+}
+
+// errPath is the path of cerr in the form of Node.Path.String().
+func errPath(cerr cueerrors.Error) string {
+	labels := cerr.Path()
+	sels := make([]cue.Selector, 0, len(labels))
+	for _, label := range labels {
+		if idx, err := strconv.Atoi(label); err == nil { // a list element
+			sels = append(sels, cue.Index(idx))
+		} else {
+			sels = append(sels, cue.Str(label))
+		}
+	}
+	return cue.MakePath(sels...).String()
 }
 
 // secret reports @menu(secret). The field iterator sometimes drops

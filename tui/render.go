@@ -220,7 +220,10 @@ func markers(node *model.Node) string {
 	if node.Set {
 		out += " *"
 	}
-	if node.Missing {
+	switch {
+	case node.Missing && node.Secret:
+		out += " (from environment)"
+	case node.Missing:
 		out += " ⚠ required"
 	}
 	if len(node.Errors) > 0 {

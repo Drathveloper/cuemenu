@@ -50,7 +50,7 @@ cuemenu help                                  # full help: commands, flags, edit
 | a package that is `[string]: T` or `#A \| #B` at its top level | the top menu is that map or variant |
 | anything else | CUE expression editor |
 
-A field's documentation comes from its `//` comments. `@menu(secret)` hides the value on screen.
+A field's documentation comes from its `//` comments. `@menu(secret)` hides the value on screen; on a required field (`password!: string @menu(secret)`) it also means the value may come from the environment instead: it can be left empty, `check` does not ask for it and `export` leaves it out.
 
 ## Writing schemas
 

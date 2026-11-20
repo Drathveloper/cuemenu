@@ -1,8 +1,10 @@
 package model_test
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -1081,5 +1083,32 @@ func TestElementOutOfValue(t *testing.T) {
 	set(t, c, "s.x.d.w[0].p", "a")
 	if got := exportJSON(t, c); got != `{"s":{"x":{"d":{"w":[{"p":"a"}]}}}}` {
 		t.Errorf("export: %s", got)
+	}
+}
+
+// A required secret may be left out: the environment gives it.
+func TestSecretFromEnvironment(t *testing.T) {
+	c := compile(t, `db: {user: "app", password!: string @menu(secret)}
+items: [{key!: string @menu(secret), name: "a"}]
+port!: int`)
+	if err := c.Check(); err == nil || strings.Contains(err.Error(), "password") || strings.Contains(err.Error(), "key") ||
+		!strings.Contains(err.Error(), "port") {
+		t.Fatalf("only port should be missing: %v", err)
+	}
+	set(t, c, "port", 1)
+	if err := c.Check(); err != nil {
+		t.Fatal(err)
+	}
+	out, err := c.Export("json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]any{"db": map[string]any{"user": "app"}, "items": []any{map[string]any{"name": "a"}}, "port": 1.0}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("export = %s", out)
 	}
 }
